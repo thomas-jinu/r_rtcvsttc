@@ -26,6 +26,8 @@ __2026-10-02 - 4-site and 8-site calculations are running.__: Data has been adde
 
 ## Home
 
+__2026-11-08 - Reorganized folders in project directory and moved markdown notes here instead of Zettler.__
+
 ## Reading
 
 ## Updates
