@@ -205,7 +205,7 @@ def build_input_td(
                 "\n".join(
                     [
                         "# --- Solver / run control ---",
-                        'SolverOptions = "twositedmrg,usecomplex,restart,TargetingExpression";',
+                        'SolverOptions = "twositedmrg,usecomplex,restart,recoveryenableread,TargetingExpression,noclobber";',
                         'Version = "stc_vs_ttc";',
                         f'string RecoverySave = "%l%%1,@keep,@M={args.Pump_time_steps}";',
                         f'OutputFile = "{run_name}";',

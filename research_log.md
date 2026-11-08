@@ -6,7 +6,7 @@ _This log has only been regularly updated since 2026-11-08._
 
 ## Code
 
-__Repo__: https://github.com/thomas-jinu/r_stcvsttc
+__Repo__: https://github.com/thomas-jinu/r_rtcvsttc
 
 __2026-09-22 – The two-time scripts all handle TSPAdvanceEach = 2 * (N-2)__: Otherwise time changes at the border for every loop and for the first and last loop only half of the lattice is on the same time.
 
@@ -24,9 +24,11 @@ __2026-10-20 - Tested GPUs with magma__: GPU's are faster. Magma needs a PR for 
 
 __2026-10-02 - 4-site and 8-site calculations are running.__: Data has been added to folders.
 
+__2026-11-08 - 12-site runs for GPU.__: This atleast can go on manuscript if I cannot go higher. ED runs are at 10 sites.
+
 ## Home
 
-__2026-11-08 - Reorganized folders in project directory and moved markdown notes here instead of Zettler.__
+__2026-11-08 - Reorganized project directory.__ Moved markdown notes here instead of Zettler.__
 
 ## Reading
 
