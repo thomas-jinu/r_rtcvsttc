@@ -17,3 +17,4 @@
 !code/**/*.pbs
 !code/**/*.sh
 !code/**/*.ipynb
+!research_log.md

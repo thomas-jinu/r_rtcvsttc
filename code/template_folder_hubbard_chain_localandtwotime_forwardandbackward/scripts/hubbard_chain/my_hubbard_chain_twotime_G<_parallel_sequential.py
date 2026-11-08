@@ -329,7 +329,7 @@ def build_input_evolve_backward(
     restart_filename_evolve: str,
 ) -> str:
     """Build the time-evolution input after applying the operator."""
-    remaining_steps = step
+    remaining_steps = step + 1
 
     if remaining_steps == 1:
         finite_loops = args.TSPAdvanceEach // (args.sites - 2)
@@ -684,7 +684,7 @@ def run_one_step(
     step_folder: Path,
     input_path_apply: Path,
     input_path_evolve_forward: Path,
-    input_path_evolve_backward: Path,
+    input_path_evolve_backward: Path | None,
     cpus_per_task: int,
 ) -> None:
     """Run the apply and evolve calculations for one time step."""
@@ -699,12 +699,13 @@ def run_one_step(
         operator=TWOTIME_OPERATOR_LABEL,
         cpus_per_task=cpus_per_task,
     )
-    run_dmrg(
-        step_folder,
-        input_path_evolve_backward,
-        operator=TWOTIME_OPERATOR_LABEL,
-        cpus_per_task=cpus_per_task,
-    )
+    if input_path_evolve_backward is not None:
+        run_dmrg(
+            step_folder,
+            input_path_evolve_backward,
+            operator=TWOTIME_OPERATOR_LABEL,
+            cpus_per_task=cpus_per_task,
+        )
 
 
 def main() -> int:
@@ -769,6 +770,8 @@ def main() -> int:
             encoding="utf-8",
         )
 
+        print(f"Wrote Ainur input: {input_path_apply}")
+
         input_path_evolve_forward = (
             step_folder / f"input_twotime_{run_name}_evolve_forward.ain"
         )
@@ -783,33 +786,42 @@ def main() -> int:
             ),
             encoding="utf-8",
         )
-        input_path_evolve_backward = (
-            step_folder / f"input_twotime_{run_name}_evolve_backward.ain"
-        )
-        input_path_evolve_backward.write_text(
-            build_input_evolve_backward(
-                args,
-                f"twotime_{run_name}",
-                step=step,
-                time_axis=time_axis,
-                pump_axis=pump_axis,
-                restart_filename_evolve=f"twotime_{run_name}_apply",
-            ),
-            encoding="utf-8",
-        )
-
-        print(f"Wrote Ainur input: {input_path_apply}")
         print(f"Wrote Ainur input: {input_path_evolve_forward}")
-        print(f"Wrote Ainur input: {input_path_evolve_backward}")
 
-        step_jobs.append(
-            (
-                step_folder,
-                input_path_apply,
-                input_path_evolve_forward,
-                input_path_evolve_backward,
+        if step != 0:
+            input_path_evolve_backward = (
+                step_folder / f"input_twotime_{run_name}_evolve_backward.ain"
             )
-        )
+            input_path_evolve_backward.write_text(
+                build_input_evolve_backward(
+                    args,
+                    f"twotime_{run_name}",
+                    step=step,
+                    time_axis=time_axis,
+                    pump_axis=pump_axis,
+                    restart_filename_evolve=f"twotime_{run_name}_apply",
+                ),
+                encoding="utf-8",
+            )
+
+            print(f"Wrote Ainur input: {input_path_evolve_backward}")
+
+            step_jobs.append(
+                (
+                    step_folder,
+                    input_path_apply,
+                    input_path_evolve_forward,
+                    input_path_evolve_backward,
+                )
+            )
+        else:
+            step_jobs.append(
+                (
+                    step_folder,
+                    input_path_apply,
+                    input_path_evolve_forward,
+                )
+            )
 
     # step_jobs remains in chronological order: 0, 1, 2, ..., final step.
     if args.cluster == "nersc":
