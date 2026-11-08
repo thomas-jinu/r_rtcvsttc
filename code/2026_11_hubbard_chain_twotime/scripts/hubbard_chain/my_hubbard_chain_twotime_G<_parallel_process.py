@@ -89,9 +89,9 @@ def save_arguments(args: argparse.Namespace, output_path: Path) -> None:
         json.dump(values, file, indent=2)
 
 
-def find_evolve_output(step_folder: Path, run_name: str) -> Path:
+def find_evolve_output_forward(step_folder: Path, run_name: str) -> Path:
     """Find the DMRG++ evolve output file for one step."""
-    candidates = (step_folder / f"runForinput_{run_name}_evolve.cout",)
+    candidates = (step_folder / f"runForinput_{run_name}_evolve_forward.cout",)
 
     for path in candidates:
         if path.exists():
@@ -100,13 +100,20 @@ def find_evolve_output(step_folder: Path, run_name: str) -> Path:
     raise FileNotFoundError(f"No evolve output found in {step_folder}")
 
 
-def read_operator_output(output_path: Path) -> dict[tuple[int, float], complex]:
-    """Read operator data after ``FiniteLoops printing ends``.
+def find_evolve_output_backward(step_folder: Path, run_name: str) -> Path:
+    """Find the DMRG++ evolve output file for one step."""
+    candidates = (step_folder / f"runForinput_{run_name}_evolve_backward.cout",)
 
-    A dictionary avoids creating an intermediate NumPy array only to iterate over
-    it later.  Its key also preserves the original "last occurrence wins" rule.
-    """
-    values = {}
+    for path in candidates:
+        if path.exists():
+            return path
+
+    raise FileNotFoundError(f"No evolve output found in {step_folder}")
+
+
+def read_operator_output(output_path: Path) -> np.ndarray:
+    """Read operator data after ``FiniteLoops printing ends``."""
+    rows_by_key = {}
     collecting = False
 
     with output_path.open("r", encoding="utf-8") as file:
@@ -122,12 +129,22 @@ def read_operator_output(output_path: Path) -> dict[tuple[int, float], complex]:
                 continue
 
             site_index = int(match.group(1))
+            real_part = float(match.group(2))
+            imaginary_part = float(match.group(3))
             time = float(match.group(4))
-            values[(site_index, time)] = complex(
-                float(match.group(2)), float(match.group(3))
-            )
 
-    return values
+            # If the same site/time appears again, keep the last value.
+            rows_by_key[(site_index, time)] = [
+                site_index,
+                real_part,
+                imaginary_part,
+                time,
+            ]
+
+    if not rows_by_key:
+        return np.empty((0, 4), dtype=float)
+
+    return np.asarray(list(rows_by_key.values()), dtype=float)
 
 
 def collect_twotime_data(
@@ -136,7 +153,6 @@ def collect_twotime_data(
     number_of_steps: int,
     time_axis: list[float],
     center_site: int,
-    workers: int,
 ) -> dict[tuple[float, float, int, int], complex]:
     """
     Return:
@@ -146,37 +162,42 @@ def collect_twotime_data(
 
     Repeated keys retain the last value.
     """
-    # Locate files before starting workers so missing-output errors remain clear.
-    output_paths = [
-        find_evolve_output(twotime_folder / f"step_{step:04d}", run_name)
-        for step in range(number_of_steps)
-    ]
     data = {}
-    if not output_paths:
-        return data
 
-    # Parsing DMRG output is CPU-heavy (regular expressions and float conversion),
-    # so processes bypass the GIL. executor.map returns results in step order,
-    # retaining the original behavior if time_axis contains duplicate values.
-    max_workers = min(workers, number_of_steps)
-    if max_workers == 1:
-        parsed_steps = map(read_operator_output, output_paths)
-        executor = None
-    else:
-        executor = ProcessPoolExecutor(max_workers=max_workers)
-        chunk_size = max(1, number_of_steps // (max_workers * 4))
-        parsed_steps = executor.map(
-            read_operator_output, output_paths, chunksize=chunk_size
-        )
+    for step in range(number_of_steps):
+        step_folder = twotime_folder / f"step_{step:04d}"
+        output_path_forward = find_evolve_output_forward(step_folder, run_name)
+        output_path_backward = find_evolve_output_backward(step_folder, run_name)
+        step_data_forward = read_operator_output(output_path_forward)
+        step_data_backward = read_operator_output(output_path_backward)
 
-    try:
-        for step, step_data in enumerate(parsed_steps):
-            t_prime = float(time_axis[step])
-            for (site, time), value in step_data.items():
-                data[(t_prime, time, center_site, site)] = value
-    finally:
-        if executor is not None:
-            executor.shutdown(wait=True, cancel_futures=True)
+        t_prime = float(time_axis[step])
+
+        for site, real_part, imaginary_part, t in step_data_forward:
+            key = (
+                t_prime,
+                float(t),
+                int(center_site),
+                int(site),
+            )
+
+            data[key] = complex(
+                real_part,
+                imaginary_part,
+            )
+
+        for site, real_part, imaginary_part, t in step_data_backward:
+            key = (
+                t_prime,
+                float(t),
+                int(center_site),
+                int(site),
+            )
+
+            data[key] = complex(
+                real_part,
+                imaginary_part,
+            )
 
     return data
 
@@ -224,9 +245,8 @@ def process_twotime_results(
     base_directory: Path,
     run_name: str,
     number_of_steps: int,
-    time_axis: list[float],
+    time_axis,
     center_site: int,
-    workers: int,
 ) -> Path:
     """Collect an existing run and write its combined CSV file."""
     twotime_folder = base_directory / f"{run_name}"
@@ -242,7 +262,6 @@ def process_twotime_results(
         number_of_steps=number_of_steps,
         time_axis=time_axis,
         center_site=center_site,
-        workers=workers,
     )
 
     csv_path = base_directory / f"{run_name}_P2_c_P3_centersite={center_site}.csv"
