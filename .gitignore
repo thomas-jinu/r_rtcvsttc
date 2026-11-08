@@ -4,6 +4,7 @@
 
 **/__pycache__/
 *.py[cod]
+research_log.md
 
 
 !.gitignore
@@ -17,5 +18,8 @@
 !code/**/*.pbs
 !code/**/*.sh
 !code/**/*.ipynb
-!writing/**/*.md
+!writing/
+!writing/**/
+!writing/markdown_notes/*.md
+
 
