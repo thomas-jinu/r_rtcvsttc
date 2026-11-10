@@ -20,11 +20,15 @@ __2026-10-14 - Added tests for CPU vs GPU for performance checks__: Tested on NE
 
 __2026-10-20 - Tested GPUs with magma__: GPU's are faster. Magma needs a PR for Krylove Time Evolution. Fix implemented with Codex in my personal fork of dmrg++. PR for this added as a future task.
 
+__2026-11-08 - GPU testing on NERSC with 12-site runs__: dmrg++ compiles with Release on NERSC without issues. Kokkos with threads is the fastest followed by Kokkos with openmp and Kokkos with serial for GPU runs. Multi-gpu runs failed.
+
+__2026-11-09 - Backward Time Evolution with Gonzalo__: Gonzalo put in a fix but the tests reveal a new issue in apply stage that was not caught before. Probably wasn't caught from my earlier versions of code from copy_dmrg either. 
+
 ## Data
 
 __2026-10-02 - 4-site and 8-site calculations are running.__: Data has been added to folders.
 
-__2026-11-08 - 12-site runs for GPU.__: This atleast can go on manuscript if I cannot go higher. ED runs are at 10 sites.
+__2026-11-08 - 12-site runs for GPU scheduled on NERSC.__: This atleast can go on manuscript if I cannot go higher. ED runs are at 10 sites. 12 site runs are for Tmax=50 and Tmax=100 with delta_t=0.1. Kokkos_Threads is used. 
 
 ## Home
 
