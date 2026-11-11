@@ -22,7 +22,7 @@ DMRG_EXECUTABLES = {
     "local": Path(
         "/Users/qqt/Documents/Codes/dmrgpp_backwardevolve/copy_dmrg/build/dmrg/dmrg"
     ),
-    "nersc": Path("/global/common/software/m5228/dmrgpp/installdir/bin/dmrg"),
+    "nersc": Path("/pscratch/sd/t/thomasj2/r_rtcvsttc/data/2026_november/10_4sitetestruns_GPU/copy_dmrg/build_perlmutter_nvidia_cuda/dmrg/dmrg"),
     # "nersc": Path(
     #     "/Users/qqt/Documents/Codes/dmrgpp_pvector/copy_dmrg/installdir/bin/dmrg"
     # ),
@@ -156,8 +156,8 @@ def main() -> int:
         slurm_path = run_folder / f"batch_{run_name}.slurm"
         body = f"""#!/bin/bash
 #SBATCH --account=m5228
-#SBATCH --qos=shared
-#SBATCH --constraint=cpu
+#SBATCH --qos=regular
+#SBATCH --constraint=gpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
@@ -168,10 +168,15 @@ def main() -> int:
 
 set -euo pipefail
 
-module load PrgEnv-gnu/8.7.0
-module load cray-mpich/9.1.0
-module load cray-libsci/26.03.0
+module load cray-mpich/9.0.1
+module load cray-libsci/25.09.0
 module load cray-hdf5/1.14.3.7
+module load PrgEnv-nvidia
+module load cudatoolkit
+
+export OMP_NUM_THREADS=32
+export OMP_PLACES=cores
+export OMP_PROC_BIND=spread
 
 export CC=cc
 export CXX=CC

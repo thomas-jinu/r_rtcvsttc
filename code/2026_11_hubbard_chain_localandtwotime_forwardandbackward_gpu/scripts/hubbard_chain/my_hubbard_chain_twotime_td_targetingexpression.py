@@ -21,7 +21,7 @@ DMRG_EXECUTABLES = {
         "/Users/qqt/Documents/Codes/dmrgpp_backwardevolve/copy_dmrg/build/dmrg/dmrg"
     ),
     "nersc": Path(
-        "/Users/qqt/Documents/Codes/dmrgpp_backwardevolve/copy_dmrg/build/dmrg/dmrg"
+        "/pscratch/sd/t/thomasj2/r_rtcvsttc/data/2026_november/10_4sitetestruns_GPU/copy_dmrg/build_perlmutter_nvidia_cuda/dmrg/dmrg"
     ),
     # "nersc": Path(
     #     "/Users/qqt/Documents/Codes/dmrgpp_pvector/copy_dmrg/installdir/bin/dmrg"
@@ -379,22 +379,28 @@ def write_multi_frequency_batch(args: argparse.Namespace) -> Path:
     frequency_count = len(args.pump_frequencies)
     body = f"""#!/bin/bash
 #SBATCH --account=m5228
-#SBATCH --qos=shared
+#SBATCH --qos=regular
 #SBATCH --constraint=gpu
 #SBATCH --nodes={frequency_count}
 #SBATCH --ntasks={frequency_count}
 #SBATCH --cpus-per-task={args.cpus_per_task}
-#SBATCH --time=6:00:00
+#SBATCH --gpus-per-task=4
+#SBATCH --time=00:15:00
 #SBATCH --job-name=dmrg_td_frequencies
 #SBATCH --output=%x-%j.out
 #SBATCH --error=%x-%j.err
 
 set -euo pipefail
 
-module load PrgEnv-gnu/8.7.0
-module load cray-mpich/9.1.0
-module load cray-libsci/26.03.0
+module load cray-mpich/9.0.1
+module load cray-libsci/25.09.0
 module load cray-hdf5/1.14.3.7
+module load PrgEnv-nvidia
+module load cudatoolkit
+
+export OMP_NUM_THREADS={max(1, args.cpus_per_task // 2)}
+export OMP_PLACES=cores
+export OMP_PROC_BIND=spread
 
 {chr(10).join(commands)}
 
@@ -493,27 +499,27 @@ def main() -> int:
 
         body = f"""#!/bin/bash
 #SBATCH --account=m5228
-#SBATCH --qos=shared
+#SBATCH --qos=regular
 #SBATCH --constraint=gpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task={args.cpus_per_task}
-#SBATCH --time=6:00:00
+#SBATCH --time=1:00:00
+#SBATCH --gpus-per-task=4
 #SBATCH --job-name=dmrg_frequency
 #SBATCH --output=%x-%j.out
 #SBATCH --error=%x-%j.err
 
 set -euo pipefail
 
-module load PrgEnv-gnu/8.7.0
-module load cray-mpich/9.1.0
-module load cray-libsci/26.03.0
+module load cray-mpich/9.0.1
+module load cray-libsci/25.09.0
 module load cray-hdf5/1.14.3.7
+module load PrgEnv-nvidia
+module load cudatoolkit
 
-export SLURM_CPU_BIND="cores"
-
-export OMP_NUM_THREADS={physical_cores_per_task}
-export OMP_PLACES=cores   
+export OMP_NUM_THREADS={max(1, args.cpus_per_task // 2)}
+export OMP_PLACES=cores
 export OMP_PROC_BIND=spread
 
 cd "{run_folder_td}"
