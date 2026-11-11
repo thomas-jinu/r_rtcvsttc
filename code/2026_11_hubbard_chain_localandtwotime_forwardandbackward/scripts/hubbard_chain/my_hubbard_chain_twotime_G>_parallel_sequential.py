@@ -5,24 +5,21 @@ Generate and optionally run a two-time Hubbard-chain calculation.
 import argparse
 import csv
 import json
-import math
 import os
 import re
 import shutil
 import subprocess
-from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import UTC, datetime
 from pathlib import Path
-
-import numpy as np
 
 # Location of the current DMRG++ executables for different clusters. Adjust these paths as needed. The location is printed when the script is completed.
 DMRG_EXECUTABLES = {
     "local": Path(
         "/Users/qqt/Documents/Codes/dmrgpp_backwardevolve/copy_dmrg/build/dmrg/dmrg"
     ),
-    "nersc": Path("/global/common/software/m5228/dmrgpp/installdir/bin/dmrg"),
+    "nersc": Path(
+        "/Users/qqt/Documents/Codes/dmrgpp_backwardevolve/copy_dmrg/build/dmrg/dmrg"
+    ),
     # "nersc": Path(
     #     "/Users/qqt/Documents/Codes/dmrgpp_pvector/copy_dmrg/installdir/bin/dmrg"
     # ),
@@ -33,6 +30,7 @@ DMRG_EXECUTABLES = {
 DMRG_PRECISION = 12
 
 TWOTIME_OPERATOR_LABEL = "<P2|c|P3>"
+APPLY_OPERATOR_LABEL = "<P0|c|P1>"
 
 TWOTIME_COLLECTION_MARKER = "FiniteLoops printing ends"
 
@@ -61,17 +59,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "finite_kept", type=int, help="Number of states in finite loops"
     )
-    parser.add_argument(
-        "TSPAdvanceEach",
-        type=int,
-        help="Multiples of N-2",
-    )
-    parser.add_argument("TSPTau", type=float, help="Time step size for the pump table")
-    parser.add_argument("Pump_Amplitude", type=float)
-    parser.add_argument("Pump_Frequency", type=float)
-    parser.add_argument("Pump_time_delay", type=float)
-    parser.add_argument("Pump_pulse_width", type=float)
-    parser.add_argument("Pump_time_steps", type=int)
     parser.add_argument("cluster", choices=DMRG_EXECUTABLES)
     parser.add_argument("center_site", type=int, help="Index of the center site")
     parser.add_argument(
@@ -80,10 +67,11 @@ def parse_args() -> argparse.Namespace:
         help="Number of finite loops for applying the operator step",
     )
     parser.add_argument("td_folder", type=Path, help="Folder name for td files")
-    parser.add_argument(
+    execution_group = parser.add_mutually_exclusive_group()
+    execution_group.add_argument(
         "--run", action="store_true", help="Run DMRG++ after generating inputs"
     )
-    parser.add_argument(
+    execution_group.add_argument(
         "--submit", action="store_true", help="Submit DMRG++ job after generating input"
     )
     parser.add_argument(
@@ -105,20 +93,73 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def load_td_run_data(args: argparse.Namespace) -> tuple[list[float], list[float]]:
+    """Load time/pump parameters and the exact pump table from the TD run."""
+    args.td_folder = args.td_folder.resolve()
+    if not args.td_folder.is_dir():
+        raise FileNotFoundError(f"TD run folder not found: {args.td_folder}")
+
+    argument_files = sorted(args.td_folder.glob("input_args_td_*.json"))
+    if len(argument_files) != 1:
+        raise FileNotFoundError(
+            "Expected exactly one input_args_td_*.json file in "
+            f"{args.td_folder}, found {len(argument_files)}"
+        )
+
+    with argument_files[0].open("r", encoding="utf-8") as file:
+        td_args = json.load(file)
+
+    required_parameters = (
+        "TSPAdvanceEach",
+        "TSPTau",
+        "Pump_Amplitude",
+        "Pump_Frequency",
+        "Pump_time_delay",
+        "Pump_pulse_width",
+        "Pump_time_steps",
+    )
+    missing_parameters = [key for key in required_parameters if key not in td_args]
+    if missing_parameters:
+        raise ValueError(
+            "TD argument file is missing: " + ", ".join(missing_parameters)
+        )
+    for key in required_parameters:
+        setattr(args, key, td_args[key])
+
+    pump_table_path = args.td_folder / "pump_table.csv"
+    if not pump_table_path.is_file():
+        raise FileNotFoundError(f"Pump table not found: {pump_table_path}")
+
+    with pump_table_path.open("r", newline="", encoding="utf-8") as file:
+        reader = csv.DictReader(file)
+        rows = list(reader)
+
+    if not rows:
+        raise ValueError(f"Pump table is empty: {pump_table_path}")
+
+    try:
+        time_axis = [float(row["time"]) for row in rows]
+        pump_axis = [float(row["pump"]) for row in rows]
+    except (KeyError, ValueError) as error:
+        raise ValueError(f"Invalid pump table: {pump_table_path}") from error
+
+    return time_axis, pump_axis
+
+
 def validate_args(args: argparse.Namespace) -> None:
     """Validate constraints required by the finite-loop construction."""
     if args.sites <= 2:
         raise ValueError("sites must be greater than 2")
-    if args.Pump_time_steps <= 0 or args.Pump_time_steps % 2 == 0:
-        raise ValueError("Pump_time_steps must be a positive odd number")
     if args.TSPAdvanceEach <= 0:
         raise ValueError("TSPAdvanceEach must be positive")
-    if args.TSPAdvanceEach % (args.sites - 2) != 0:
-        raise ValueError("TSPAdvanceEach must be a multiple of sites - 2")
+    if args.TSPAdvanceEach != (args.sites - 2):
+        raise ValueError("This script only supports TSPAdvanceEach equal to sites - 2")
     if args.Pump_pulse_width == 0:
         raise ValueError("Pump_pulse_width must be nonzero")
     if args.n_tasks < 2:
         raise ValueError("n_tasks must be at least 2")
+    if args.submit and args.cluster != "nersc":
+        raise ValueError("--submit is only supported for the nersc cluster")
 
 
 def save_arguments(args: argparse.Namespace, output_path: Path) -> None:
@@ -191,6 +232,7 @@ def build_input_apply(
                         finite_rows,
                         "];",
                         "RestartMapStages=0;",
+                        "RestartMappingTvs=[0,-1,-1,-1];",
                         "string P0 = |P0>;",
                         f'string P1 = "c[{args.center_site}]\'*|P0>";',
                     ]
@@ -211,7 +253,7 @@ def build_input_apply(
     )
 
 
-def build_input_evolve(
+def build_input_evolve_forward(
     args: argparse.Namespace,
     run_name: str,
     time_axis: list[float],
@@ -307,9 +349,10 @@ def build_input_evolve(
                 "\n".join(
                     [
                         "# --- Solver / run control ---",
-                        'SolverOptions = "twositedmrg,usecomplex,restart,TargetingExpression,minimizedisk";',
+                        'SolverOptions = "twositedmrg,usecomplex,restart,TargetingExpression,recoveryEnableRead";',
                         'Version = "stc_vs_ttc_apply_evolve";',
-                        f'OutputFile = "{run_name}_evolve";',
+                        'string RecoverySave = "%l%%1,@keep,@M=1";',
+                        f'OutputFile = "{run_name}_evolve_forward";',
                         f'RestartFilename = "{restart_filename_evolve}";',
                         "GsWeight = 0.0;",
                     ]
@@ -320,201 +363,98 @@ def build_input_evolve(
     )
 
 
-def create_time_axis(nsteps: int, step_size: float) -> list[float]:
-    """Create the time values used by the pump table."""
-    return [round(index * step_size, 9) for index in range(nsteps)]
-
-
-def create_pump_axis(
+def build_input_evolve_backward(
+    args: argparse.Namespace,
+    run_name: str,
     time_axis: list[float],
-    amplitude: float,
-    omega_pump: float,
-    t_delay: float,
-    sigma: float,
-) -> list[float]:
-    """Create Gaussian-envelope cosine pump values."""
-    return [
-        (rounded_value if rounded_value != 0 else 0.0)
-        for rounded_value in (
-            round(
-                amplitude
-                * math.exp(-0.5 * ((time - t_delay) / sigma) ** 2)
-                * math.cos(omega_pump * (time - t_delay)),
-                7,
-            )
-            for time in time_axis
+    pump_axis: list[float],
+    step: int,
+    restart_filename_evolve: str,
+) -> str:
+    """Build the time-evolution input after applying the operator."""
+    remaining_steps = step + 1
+
+    finite_loops = remaining_steps * (args.TSPAdvanceEach // (args.sites - 2)) - 1
+
+    finite_rows = ",\n".join(
+        f"    [@auto, {args.finite_kept}, 2]" for _ in range(finite_loops)
+    )
+
+    aversus_t_table = "\n".join(
+        f"    [{time:.15g}, {pump:.15g}],"
+        for time, pump in reversed(
+            list(zip(time_axis[: step + 1], pump_axis[: step + 1]))
         )
+    ).rstrip(",")
+
+    targeting_expression = [
+        "RestartMappingTvs=[0, 1, -1, -1];",
+        'string P0="|P0>";',
+        'string P1="|P1>";',
+        f'string P2="TimeEvolve{{tau={-args.TSPTau},steps=5,advanceEach={args.TSPAdvanceEach}}}*|P0>";',
+        f'string P3="TimeEvolve{{tau={-args.TSPTau},steps=5,advanceEach={args.TSPAdvanceEach}}}*|P1>";',
     ]
 
-
-def write_pump_table(
-    pump_table: Iterable[tuple[float, float]],
-    output_path: Path,
-) -> None:
-    """Write time and pump values to CSV."""
-    with output_path.open("w", newline="", encoding="utf-8") as csv_file:
-        writer = csv.writer(csv_file)
-        writer.writerow(["time", "pump"])
-        writer.writerows((f"{time:.7f}", f"{pump:.7f}") for time, pump in pump_table)
-
-
-def find_evolve_output(step_folder: Path, run_name: str) -> Path:
-    """Find the DMRG++ evolve output file for one step."""
-    candidates = (step_folder / f"runForinput_{run_name}_evolve.cout",)
-
-    for path in candidates:
-        if path.exists():
-            return path
-
-    raise FileNotFoundError(f"No evolve output found in {step_folder}")
-
-
-def read_operator_output(output_path: Path) -> np.ndarray:
-    """Read operator data after ``FiniteLoops printing ends``."""
-    rows_by_key = {}
-    collecting = False
-
-    with output_path.open("r", encoding="utf-8") as file:
-        for line in file:
-            if TWOTIME_COLLECTION_MARKER in line:
-                collecting = True
-                continue
-            if not collecting or TWOTIME_OPERATOR_LABEL not in line:
-                continue
-
-            match = TWOTIME_OPERATOR_PATTERN.search(line)
-            if match is None:
-                continue
-
-            site_index = int(match.group(1))
-            real_part = float(match.group(2))
-            imaginary_part = float(match.group(3))
-            time = float(match.group(4))
-
-            # If the same site/time appears again, keep the last value.
-            rows_by_key[(site_index, time)] = [
-                site_index,
-                real_part,
-                imaginary_part,
-                time,
-            ]
-
-    if not rows_by_key:
-        return np.empty((0, 4), dtype=float)
-
-    return np.asarray(list(rows_by_key.values()), dtype=float)
-
-
-def collect_twotime_data(
-    twotime_folder: Path,
-    run_name: str,
-    number_of_steps: int,
-    time_axis: list[float],
-    center_site: int,
-) -> dict[tuple[float, float, int, int], complex]:
-    """
-    Return:
-        {
-            (t_prime, t, center_site, site): complex_green_value
-        }
-
-    Repeated keys retain the last value.
-    """
-    data = {}
-
-    for step in range(number_of_steps):
-        step_folder = twotime_folder / f"step_{step:04d}"
-        output_path = find_evolve_output(step_folder, run_name)
-        step_data = read_operator_output(output_path)
-
-        t_prime = float(time_axis[step])
-
-        for site, real_part, imaginary_part, t in step_data:
-            key = (
-                t_prime,
-                float(t),
-                int(center_site),
-                int(site),
-            )
-
-            data[key] = complex(
-                real_part,
-                imaginary_part,
-            )
-
-    return data
-
-
-def save_twotime_csv(
-    data: dict[tuple[float, float, int, int], complex],
-    output_path: Path,
-) -> None:
-    """
-    Save two-time Green's-function data to CSV.
-
-    Dictionary format:
-        {
-            (t_prime, t, center_site, site): complex_value
-        }
-    """
-    with output_path.open("w", newline="", encoding="utf-8") as file:
-        writer = csv.writer(file)
-
-        writer.writerow(
+    return (
+        "\n\n".join(
             [
-                "t_prime",
-                "t",
-                "center_site",
-                "site_index",
-                "real_part",
-                "imaginary_part",
+                "##Ainur1.0",
+                "\n".join(
+                    [
+                        "# --- Model parameters ---",
+                        f"TotalNumberOfSites = {args.sites};",
+                        "NumberOfTerms = 1;",
+                        "DegreesOfFreedom = 1;",
+                        'GeometryKind = "chain";',
+                        'GeometryOptions = "ConstantValues";',
+                        f"dir0:Connectors = [{args.t}];",
+                        f"hubbardU = [{args.U}, ...];",
+                        f"potentialV = [{args.potentialV}, ...];",
+                        'Model = "HubbardOneBand";',
+                    ]
+                ),
+                "\n".join(
+                    [
+                        "# --- Pump parameters --- #",
+                        "matrix AversusTime = [",
+                        f"{aversus_t_table}",
+                        "];",
+                        "GeometryFactor = exp:*:1.0i:!readTableAversusTime,%t;",
+                    ]
+                ),
+                "\n".join(
+                    [
+                        "# --- Fock Space parameters ---",
+                        f"TargetElectronsUp = {args.up};",
+                        f"TargetElectronsDown = {args.down};",
+                    ]
+                ),
+                "\n".join(
+                    [
+                        "# --- DMRG++ control parameters ---",
+                        "TruncationTolerance = 1e-12;",
+                        "FiniteLoops = [",
+                        finite_rows,
+                        "];",
+                        "RestartMapStages=0;",
+                        *targeting_expression,
+                    ]
+                ),
+                "\n".join(
+                    [
+                        "# --- Solver / run control ---",
+                        'SolverOptions = "twositedmrg,usecomplex,restart,TargetingExpression,recoveryEnableRead";',
+                        'Version = "stc_vs_ttc_apply_evolve";',
+                        'string RecoverySave = "%l%%1,@keep,@M=1";',
+                        f'OutputFile = "{run_name}_evolve_backward";',
+                        f'RestartFilename = "{restart_filename_evolve}";',
+                        "GsWeight = 0.0;",
+                    ]
+                ),
             ]
         )
-
-        for (t, tprime, center_site, site), value in sorted(data.items()):
-            writer.writerow(
-                [
-                    f"{t:.15g}",
-                    f"{tprime:.15g}",
-                    center_site,
-                    site,
-                    f"{value.real:.15g}",
-                    f"{value.imag:.15g}",
-                ]
-            )
-
-
-def process_twotime_results(
-    base_directory: Path,
-    run_name: str,
-    number_of_steps: int,
-    time_axis,
-    center_site: int,
-) -> Path:
-    """Collect an existing run and write its combined CSV file."""
-    twotime_folder = base_directory / f"{run_name}"
-
-    if not twotime_folder.is_dir():
-        raise FileNotFoundError(f"Two-time run folder not found: {twotime_folder}")
-    if number_of_steps > len(time_axis):
-        raise ValueError("number_of_steps cannot exceed the length of time_axis")
-
-    data = collect_twotime_data(
-        twotime_folder=twotime_folder,
-        run_name=run_name.split("_", 1)[-1],  # Remove G>_ from name,
-        number_of_steps=number_of_steps,
-        time_axis=time_axis,
-        center_site=center_site,
+        + "\n"
     )
-
-    csv_path = base_directory / f"{run_name}_P2_c_P3_centersite={center_site}.csv"
-
-    save_twotime_csv(
-        data=data,
-        output_path=csv_path,
-    )
-
-    return csv_path
 
 
 def run_dmrg(
@@ -548,42 +488,128 @@ def run_dmrg(
 def run_one_step(
     step_folder: Path,
     input_path_apply: Path,
-    input_path_evolve: Path,
+    input_path_evolve_forward: Path,
+    input_path_evolve_backward: Path,
     cpus_per_task: int,
 ) -> None:
     """Run the apply and evolve calculations for one time step."""
     run_dmrg(
         step_folder,
         input_path_apply,
+        operator=APPLY_OPERATOR_LABEL,
         cpus_per_task=cpus_per_task,
     )
     run_dmrg(
         step_folder,
-        input_path_evolve,
+        input_path_evolve_forward,
+        operator=TWOTIME_OPERATOR_LABEL,
+        cpus_per_task=cpus_per_task,
+    )
+
+    run_dmrg(
+        step_folder,
+        input_path_evolve_backward,
         operator=TWOTIME_OPERATOR_LABEL,
         cpus_per_task=cpus_per_task,
     )
 
 
+def write_multinode_batch(
+    args: argparse.Namespace,
+    run_folder: Path,
+    run_name: str,
+    restart_path: Path,
+) -> Path:
+    """Write a single-frequency, multi-node G< batch workflow."""
+    node_count = (args.Pump_time_steps + 1) // 2
+    process_script = Path(__file__).with_name(
+        "my_hubbard_chain_twotime_G>_parallel_process.py"
+    )
+    batch_path = run_folder / f"batch_multinode_{run_name}.slurm"
+    body = f"""#!/bin/bash
+#SBATCH --account=m5228
+#SBATCH --qos=shared
+#SBATCH --constraint=cpu
+#SBATCH --nodes={node_count}
+#SBATCH --ntasks={node_count}
+#SBATCH --cpus-per-task={args.cpus_per_task}
+#SBATCH --time=48:00:00
+#SBATCH --job-name=dmrg_ggreater
+#SBATCH --output=%x-%j.out
+#SBATCH --error=%x-%j.err
+
+set -euo pipefail
+
+module load PrgEnv-gnu/8.7.0
+module load cray-mpich/9.1.0
+module load cray-libsci/26.03.0
+module load cray-hdf5/1.14.3.7
+
+export OMP_NUM_THREADS={max(1, args.cpus_per_task // 2)}
+export OMP_PLACES=cores
+export OMP_PROC_BIND=spread
+
+RUN_FOLDER="{run_folder}"
+RUN_NAME="{run_name}"
+NODE_COUNT={node_count}
+TIME_STEPS={args.Pump_time_steps}
+CPUS_PER_TASK={args.cpus_per_task}
+active=0
+
+run_task() {{
+    local stage="$1"
+    local step="$2"
+    local operator="$3"
+    (
+        cd "$RUN_FOLDER/step_$(printf '%04d' "$step")"
+        srun --exclusive --nodes=1 --ntasks=1 --cpus-per-task="$CPUS_PER_TASK" \\
+            ./dmrg -f "input_twotime_${{RUN_NAME}}_${{stage}}.ain" \\
+            -p {DMRG_PRECISION} "$operator"
+    ) &
+}}
+
+launch() {{
+    run_task "$1" "$2" "$3"
+    active=$((active + 1))
+    if (( active >= NODE_COUNT )); then
+        wait -n
+        active=$((active - 1))
+    fi
+}}
+
+wait_for_all() {{
+    while (( active > 0 )); do
+        wait -n
+        active=$((active - 1))
+    done
+}}
+
+# Phase A: all equal-time operator applications complete before evolution starts.
+for ((step = 0; step < TIME_STEPS; ++step)); do
+    launch "apply" "$step" "{APPLY_OPERATOR_LABEL}"
+done
+wait_for_all
+
+# Phase B: longest forward and backward evolutions are launched first.
+for ((rank = 0; rank < TIME_STEPS; ++rank)); do
+    launch "evolve_forward" "$rank" "{TWOTIME_OPERATOR_LABEL}"
+    launch "evolve_backward" "$((TIME_STEPS - 1 - rank))" "{TWOTIME_OPERATOR_LABEL}"
+done
+wait_for_all
+
+python3 "{process_script}" {args.center_site} "{restart_path}" \\
+    "{args.td_folder / "pump_table.csv"}" "$RUN_FOLDER" --workers=1
+"""
+    batch_path.write_text(body, encoding="utf-8")
+    return batch_path
+
+
 def main() -> int:
     """Generate inputs, optionally run DMRG++, and collect the results."""
     args = parse_args()
-    restart_path = args.gs_filename.resolve()
-
-    time_axis = create_time_axis(
-        nsteps=args.Pump_time_steps,
-        step_size=args.TSPTau,
-    )
-
-    pump_axis = create_pump_axis(
-        time_axis,
-        amplitude=args.Pump_Amplitude,
-        omega_pump=args.Pump_Frequency,
-        t_delay=args.Pump_time_delay,
-        sigma=args.Pump_pulse_width,
-    )
-
+    time_axis, pump_axis = load_td_run_data(args)
     validate_args(args)
+    restart_path = args.gs_filename.resolve()
 
     run_name = args.td_folder.name
     print(f"Run name: {run_name}")
@@ -607,19 +633,24 @@ def main() -> int:
     step_jobs = []
 
     for step in range(args.Pump_time_steps):
+        # The padded axis starts at -0.1; physical operator times begin at 0.
+        time_index = step + 1
         step_folder = run_folder_twotime / f"step_{step:04d}"
         step_folder.mkdir(parents=True, exist_ok=True)
         print(f"Created step folder: {step_folder}")
         shutil.copy2(executable_path, step_folder / "dmrg")
 
-        restart_filename = f"../../{run_name}/Recovery{step}{run_name}"
+        if time_index == 1:
+            restart_filename = f"../../{args.gs_filename.name}"
+        else:
+            restart_filename = f"../../{run_name}/Recovery{time_index - 2}{run_name}"
 
         input_path_apply = step_folder / f"input_twotime_{run_name}_apply.ain"
         input_path_apply.write_text(
             build_input_apply(
                 args,
                 f"twotime_{run_name}",
-                step=step,
+                step=time_index,
                 time_axis=time_axis,
                 pump_axis=pump_axis,
                 restart_filename_apply=restart_filename,
@@ -627,12 +658,16 @@ def main() -> int:
             encoding="utf-8",
         )
 
-        input_path_evolve = step_folder / f"input_twotime_{run_name}_evolve.ain"
-        input_path_evolve.write_text(
-            build_input_evolve(
+        print(f"Wrote Ainur input: {input_path_apply}")
+
+        input_path_evolve_forward = (
+            step_folder / f"input_twotime_{run_name}_evolve_forward.ain"
+        )
+        input_path_evolve_forward.write_text(
+            build_input_evolve_forward(
                 args,
                 f"twotime_{run_name}",
-                step=step,
+                step=time_index,
                 time_axis=time_axis,
                 pump_axis=pump_axis,
                 restart_filename_evolve=f"twotime_{run_name}_apply",
@@ -640,114 +675,39 @@ def main() -> int:
             encoding="utf-8",
         )
 
-        print(f"Wrote Ainur input: {input_path_apply}")
-        print(f"Wrote Ainur input: {input_path_evolve}")
+        print(f"Wrote Ainur input: {input_path_evolve_forward}")
 
-        step_jobs.append((step_folder, input_path_apply, input_path_evolve))
+        input_path_evolve_backward = (
+            step_folder / f"input_twotime_{run_name}_evolve_backward.ain"
+        )
+        input_path_evolve_backward.write_text(
+            build_input_evolve_backward(
+                args,
+                f"twotime_{run_name}",
+                step=time_index,
+                time_axis=time_axis,
+                pump_axis=pump_axis,
+                restart_filename_evolve=f"twotime_{run_name}_apply",
+            ),
+            encoding="utf-8",
+        )
+        print(f"Wrote Ainur input: {input_path_evolve_backward}")
+
+        step_jobs.append(
+            (
+                step_folder,
+                input_path_apply,
+                input_path_evolve_forward,
+                input_path_evolve_backward,
+            )
+        )
 
     # step_jobs remains in chronological order: 0, 1, 2, ..., final step.
     if args.cluster == "nersc":
-        slurm_path = run_folder_twotime / f"batch_{run_name}.slurm"
-
-        # Assuming two hardware threads per physical core; never request zero
-        # OpenMP threads when cpus_per_task is 1.
-        physical_cores_per_task = max(1, args.cpus_per_task // 2)
-
-        body = f"""#!/bin/bash
-#SBATCH --account=m5228
-#SBATCH --qos=shared
-#SBATCH --constraint=cpu
-#SBATCH --nodes=1
-#SBATCH --ntasks={args.n_tasks}
-#SBATCH --cpus-per-task={args.cpus_per_task}
-#SBATCH --time=48:00:00
-#SBATCH --job-name=dmrg_twotime
-#SBATCH --output=%x-%j.out
-#SBATCH --error=%x-%j.err
-
-set -euo pipefail
-
-module load PrgEnv-gnu/8.7.0
-module load cray-mpich/9.1.0
-module load cray-libsci/26.03.0
-module load cray-hdf5/1.14.3.7
-
-export CC=cc
-export CXX=CC
-
-export SLURM_CPU_BIND="cores"
-
-export OMP_NUM_THREADS={physical_cores_per_task}
-export OMP_PLACES=cores   
-export OMP_PROC_BIND=spread
-
-export BASE=/global/common/software/m5228
-export LOCAL="$BASE/local"
-
-
-date
-
-# Start time steps from beginning to end. Refill each slot as soon as any step
-# finishes; do not wait for all running steps, which would leave CPUs idle.
-step_folders=(
-{chr(10).join(f'    "{job[0]}"' for job in step_jobs)}
-)
-active=0
-failed=0
-
-for step_folder in "${{step_folders[@]}}"; do
-    (
-        cd "$step_folder"
-
-        srun \\
-            --exclusive \\
-            --ntasks=1 \\
-            --cpus-per-task={args.cpus_per_task} \\
-            ./dmrg \\
-            -f "input_twotime_{run_name}_apply.ain" \\
-            -p "{DMRG_PRECISION}"
-
-        sleep 10  # pause for 10 seconds
-
-        srun \\
-            --exclusive \\
-            --ntasks=1 \\
-            --cpus-per-task={args.cpus_per_task} \\
-            ./dmrg \\
-            -f "input_twotime_{run_name}_evolve.ain" \\
-            -p "{DMRG_PRECISION}" \\
-            "{TWOTIME_OPERATOR_LABEL}"
-    ) &
-
-    active=$((active + 1))
-
-    # Once all slots are occupied, wait only for the next job to finish and
-    # immediately use its freed slot for the next chronological step.
-    if (( active >= {args.n_tasks} )); then
-        if ! wait -n; then
-            failed=1
-        fi
-        active=$((active - 1))
-    fi
-done
-
-# Reap jobs still running after all time steps have been launched.
-while (( active > 0 )); do
-    if ! wait -n; then
-        failed=1
-    fi
-    active=$((active - 1))
-done
-
-if (( failed != 0 )); then
-    echo "One or more two-time steps failed." >&2
-    exit 1
-fi
-
-date
-"""
-        slurm_path.write_text(body, encoding="utf-8")
-        print(f"Wrote batch script: {slurm_path}")
+        slurm_path = write_multinode_batch(
+            args, run_folder_twotime, run_name, restart_path
+        )
+        print(f"Wrote multi-node batch script: {slurm_path}")
 
     if args.run:
         with ThreadPoolExecutor(max_workers=args.n_tasks) as executor:
@@ -756,23 +716,15 @@ date
                     run_one_step,
                     step_folder,
                     input_path_apply,
-                    input_path_evolve,
+                    input_path_evolve_forward,
+                    input_path_evolve_backward,
                     args.cpus_per_task,
                 )
-                for step_folder, input_path_apply, input_path_evolve in step_jobs
+                for step_folder, input_path_apply, input_path_evolve_forward, input_path_evolve_backward in step_jobs
             ]
 
             for future in as_completed(futures):
                 future.result()
-
-        csv_path = process_twotime_results(
-            base_directory=restart_path.parent,
-            run_name=f"twotime_{run_name}",
-            center_site=args.center_site,
-            number_of_steps=args.Pump_time_steps,
-            time_axis=time_axis,
-        )
-        print(f"Wrote post-processed data: {csv_path}")
     elif args.submit:
         subprocess.run(
             ["sbatch", str(slurm_path)],

@@ -53,11 +53,12 @@ def parse_args_input() -> argparse.Namespace:
     parser.add_argument("infinite_kept", type=int)
     parser.add_argument("finite_loops", type=int)
     parser.add_argument("finite_kept", type=int)
-    parser.add_argument("cluster", choices=["local", "isaac", "nersc"])
-    parser.add_argument(
+    parser.add_argument("cluster", choices=["local", "nersc"])
+    execution_group = parser.add_mutually_exclusive_group()
+    execution_group.add_argument(
         "--run", action="store_true", help="Run DMRG++ after generating input"
     )
-    parser.add_argument(
+    execution_group.add_argument(
         "--submit", action="store_true", help="Submit DMRG++ job after generating input"
     )
     return parser.parse_args()
@@ -69,7 +70,7 @@ def build_input(args: argparse.Namespace, up: int, down: int, run_name: str) -> 
         f"    [@auto, {args.finite_kept}, @save]" for _ in range(args.finite_loops)
     )
 
-    center_site = int(args.sites / 2 - 1)
+    center_site = args.sites // 2 - 1
 
     return (
         "\n\n".join(
@@ -94,7 +95,10 @@ def build_input(args: argparse.Namespace, up: int, down: int, run_name: str) -> 
                         "# --- Fock Space parameters ---",
                         f"TargetElectronsUp = {up};",
                         f"TargetElectronsDown = {down};",
-                        'DefineOperators="double:nup*ndown,hole:identity+(-1.0)*nup+(-1.0)*ndown+nup*ndown,parity:identity+(-2.0)*n+4.0*nup*ndown,local_moment:0.75*n+(-1.5)*nup*ndown";',
+                        'DefineOperators="double:nup*ndown,'  # noqa: ISC004
+                        "hole:identity+(-1.0)*nup+(-1.0)*ndown+nup*ndown,"
+                        "parity:identity+(-2.0)*n+4.0*nup*ndown,"
+                        'local_moment:0.75*n+(-1.5)*nup*ndown";',
                     ]
                 ),
                 "\n".join(
@@ -124,7 +128,6 @@ def build_input(args: argparse.Namespace, up: int, down: int, run_name: str) -> 
 
 
 def main() -> int:
-
     args = parse_args_input()
 
     # Create the run name based on the input parameters

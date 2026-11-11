@@ -41,3 +41,7 @@ __2026-11-08 - Reorganized project directory.__ Moved markdown notes here instea
 __2026-11-06 - Thomas sked to run more GPU jobs to keep NERSC hours.__ Needs updated scripts with TSPAdvanceEach=N-2.
 
 ## Writing
+
+## Things to remember
+
+- In the TspAdvanceEach = N-2, the first time step never has all the sites. Time is changed at the boundary and since the first loop starts at the second or second to last site, the border site is always missing. Important for momentum-resolved measurements.

@@ -8,6 +8,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import subprocess
 from collections.abc import Iterable
@@ -19,7 +20,9 @@ DMRG_EXECUTABLES = {
     "local": Path(
         "/Users/qqt/Documents/Codes/dmrgpp_backwardevolve/copy_dmrg/build/dmrg/dmrg"
     ),
-    "nersc": Path("/global/common/software/m5228/dmrgpp/installdir/bin/dmrg"),
+    "nersc": Path(
+        "/Users/qqt/Documents/Codes/dmrgpp_backwardevolve/copy_dmrg/build/dmrg/dmrg"
+    ),
     # "nersc": Path(
     #     "/Users/qqt/Documents/Codes/dmrgpp_pvector/copy_dmrg/installdir/bin/dmrg"
     # ),
@@ -89,15 +92,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("TSPTau", type=float, help="Time step size for the pump table")
     parser.add_argument("Pump_Amplitude", type=float)
-    parser.add_argument("Pump_Frequency", type=float)
     parser.add_argument("Pump_time_delay", type=float)
     parser.add_argument("Pump_pulse_width", type=float)
     parser.add_argument("Pump_time_steps", type=int, help="Always do N+2 for N steps")
     parser.add_argument("cluster", choices=DMRG_EXECUTABLES)
     parser.add_argument(
+        "--pump-frequencies",
+        type=float,
+        nargs="+",
+        required=True,
+        help="One or more pump frequencies; one TD run is generated for each.",
+    )
+    execution_group = parser.add_mutually_exclusive_group()
+    execution_group.add_argument(
         "--run", action="store_true", help="Run DMRG++ after generating input"
     )
-    parser.add_argument(
+    execution_group.add_argument(
         "--submit", action="store_true", help="Submit DMRG++ job after generating input"
     )
     parser.add_argument(
@@ -120,6 +130,12 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("This script only supports TSPAdvanceEach equal to sites - 2")
     if args.Pump_pulse_width == 0:
         raise ValueError("Pump_pulse_width must be nonzero")
+    if args.Pump_time_steps <= 0:
+        raise ValueError("Pump_time_steps must be positive")
+    if args.cpus_per_task <= 0:
+        raise ValueError("cpus_per_task must be positive")
+    if args.submit and args.cluster != "nersc":
+        raise ValueError("--submit is only supported for the nersc cluster")
 
 
 def save_arguments(args: argparse.Namespace, output_path: Path) -> None:
@@ -137,12 +153,14 @@ def build_input_td(
     run_name: str,
     time_axis: list[float],
     pump_axis: list[float],
-    restart_filename: str | None = "../{Path(args.gs_filename).resolve().name}",
+    restart_filename: str | None = None,
 ) -> str:
     """Build the time-dependent reference-state input."""
+    if restart_filename is None:
+        restart_filename = f"../{args.gs_filename.resolve().name}"
 
     # Number of finite loops is determined by the number of pump time steps and the TSPAdvanceEach parameter.
-    finite_loops = args.Pump_time_steps * (args.TSPAdvanceEach // (args.sites - 2)) - 1
+    finite_loops = args.Pump_time_steps * (args.TSPAdvanceEach // (args.sites - 2))
 
     # Finite rows is the ordering of loops in DMRG++ input.
     # Numeric value 3 = 1 + 2; 1: save and 2: usefastwft
@@ -205,7 +223,7 @@ def build_input_td(
                 "\n".join(
                     [
                         "# --- Solver / run control ---",
-                        'SolverOptions = "twositedmrg,usecomplex,restart,TargetingExpression";',
+                        'SolverOptions = "twositedmrg,usecomplex,restart,TargetingExpression,recoveryEnableRead";',
                         'Version = "stc_vs_ttc";',
                         f'string RecoverySave = "%l%%1,@keep,@M={args.Pump_time_steps}";',
                         f'OutputFile = "{run_name}";',
@@ -220,8 +238,13 @@ def build_input_td(
 
 
 def create_time_axis(nsteps: int, step_size: float) -> list[float]:
-    """Create the time values used by the pump table."""
-    return [round(index * step_size, 9) for index in range(nsteps)]
+    """Create exactly nsteps physical points with fixed 0.1 padding."""
+    time_max = (nsteps - 1) * step_size
+    return [
+        -0.1,
+        *(round(index * step_size, 9) for index in range(nsteps)),
+        round(time_max + 0.1, 9),
+    ]
 
 
 def create_pump_axis(
@@ -244,6 +267,19 @@ def create_pump_axis(
             for time in time_axis
         )
     ]
+
+
+def validate_pump_at_zero(time_axis: list[float], pump_axis: list[float]) -> None:
+    """Require the pump signal to vanish at time zero."""
+    try:
+        pump_at_zero = next(
+            pump for time, pump in zip(time_axis, pump_axis) if time == 0.0
+        )
+    except StopIteration as error:
+        raise ValueError("Pump time axis does not contain 0.0") from error
+
+    if pump_at_zero != 0.0:
+        raise ValueError(f"Pump signal at time 0.0 must be 0.0, got {pump_at_zero}")
 
 
 def write_pump_table(
@@ -290,9 +326,103 @@ def frequency_tag(frequency: float) -> str:
     return f"freq_{frequency:g}".replace(".", "p")
 
 
+def frequency_command(
+    args: argparse.Namespace, frequency: float, run: bool
+) -> list[str]:
+    """Build a command that handles one frequency from a multi-frequency request."""
+    command = [
+        "python3",
+        str(Path(__file__).resolve()),
+        str(args.sites),
+        str(args.up),
+        str(args.down),
+        str(args.t),
+        str(args.U),
+        str(args.potentialV),
+        str(args.gs_filename.resolve()),
+        str(args.finite_kept),
+        str(args.TSPAdvanceEach),
+        str(args.TSPTau),
+        str(args.Pump_Amplitude),
+        str(args.Pump_time_delay),
+        str(args.Pump_pulse_width),
+        str(args.Pump_time_steps),
+        args.cluster,
+        "--pump-frequencies",
+        str(frequency),
+        "--cpus-per-task",
+        str(args.cpus_per_task),
+    ]
+    if run:
+        command.append("--run")
+    return command
+
+
+def write_multi_frequency_batch(args: argparse.Namespace) -> Path:
+    """Write one NERSC batch script that runs one frequency per node."""
+    restart_path = args.gs_filename.resolve()
+    executable_path = DMRG_EXECUTABLES[args.cluster]
+    if not restart_path.is_file():
+        raise FileNotFoundError(f"Ground-state file not found: {restart_path}")
+    if not executable_path.is_file():
+        raise FileNotFoundError(f"DMRG++ executable not found: {executable_path}")
+
+    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    batch_path = restart_path.parent / f"batch_td_frequencies_{timestamp}.slurm"
+    commands = [
+        "srun --exclusive --nodes=1 --ntasks=1 "
+        f"--cpus-per-task={args.cpus_per_task} "
+        f"{shlex.join(frequency_command(args, frequency, run=True))} &"
+        for frequency in args.pump_frequencies
+    ]
+
+    frequency_count = len(args.pump_frequencies)
+    body = f"""#!/bin/bash
+#SBATCH --account=m5228
+#SBATCH --qos=shared
+#SBATCH --constraint=gpu
+#SBATCH --nodes={frequency_count}
+#SBATCH --ntasks={frequency_count}
+#SBATCH --cpus-per-task={args.cpus_per_task}
+#SBATCH --time=6:00:00
+#SBATCH --job-name=dmrg_td_frequencies
+#SBATCH --output=%x-%j.out
+#SBATCH --error=%x-%j.err
+
+set -euo pipefail
+
+module load PrgEnv-gnu/8.7.0
+module load cray-mpich/9.1.0
+module load cray-libsci/26.03.0
+module load cray-hdf5/1.14.3.7
+
+{chr(10).join(commands)}
+
+wait
+"""
+    batch_path.write_text(body, encoding="utf-8")
+    return batch_path
+
+
 def main() -> int:
     """Generate inputs, optionally run DMRG++, and collect the results."""
     args = parse_args()
+    validate_args(args)
+
+    if len(args.pump_frequencies) > 1:
+        if args.submit:
+            batch_path = write_multi_frequency_batch(args)
+            subprocess.run(["sbatch", str(batch_path)], check=True)
+            print(f"Submitted multi-frequency TD batch: {batch_path}")
+            return 0
+        if args.run:
+            raise ValueError("Use --submit to run multiple pump frequencies")
+
+        for frequency in args.pump_frequencies:
+            subprocess.run(frequency_command(args, frequency, run=False), check=True)
+        return 0
+
+    args.Pump_Frequency = args.pump_frequencies[0]
     restart_path = args.gs_filename.resolve()
 
     time_axis = create_time_axis(
@@ -307,8 +437,7 @@ def main() -> int:
         t_delay=args.Pump_time_delay,
         sigma=args.Pump_pulse_width,
     )
-
-    validate_args(args)
+    validate_pump_at_zero(time_axis, pump_axis)
 
     timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
     run_name = f"N={args.sites}_Nup={args.up}_Ndown={args.down}_{timestamp}"
@@ -358,8 +487,8 @@ def main() -> int:
     if args.cluster == "nersc":
         slurm_path = run_folder_td / f"batch_{run_name}.slurm"
 
-        physical_cores_per_task = int(
-            args.cpus_per_task / 2
+        physical_cores_per_task = max(
+            1, args.cpus_per_task // 2
         )  # Assuming hyperthreading, adjust as needed
 
         body = f"""#!/bin/bash
