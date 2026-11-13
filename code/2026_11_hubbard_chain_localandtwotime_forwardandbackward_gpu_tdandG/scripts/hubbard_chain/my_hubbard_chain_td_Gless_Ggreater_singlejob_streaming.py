@@ -8,11 +8,13 @@ scripts are deliberately not used or modified by this script.
 """
 
 import argparse
+import atexit
 import csv
 import json
 import math
 import os
 import re
+import shlex
 import shutil
 import subprocess
 from collections.abc import Iterable
@@ -67,14 +69,14 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--recovery-settle-seconds", type=int, default=30,
-        help="Extra seconds to wait after a recovery file appears (default: 30).",
+        help="Extra seconds to wait after the next recovery file appears (default: 30).", 
     )
     return p.parse_args()
 
 
 def validate(a: argparse.Namespace) -> None:
-    if a.cluster != "nersc":
-        raise ValueError("This streaming multi-node workflow currently requires cluster=nersc")
+    if a.submit and a.cluster != "nersc":
+        raise ValueError("--submit requires cluster=nersc")
     if a.sites <= 2 or a.TSPAdvanceEach != a.sites - 2:
         raise ValueError("TSPAdvanceEach must equal sites - 2, with sites > 2")
     if a.Pump_time_steps < 1 or a.finite_kept < 1 or a.finite_loops_apply < 1:
@@ -184,7 +186,8 @@ def write_g_inputs(a: argparse.Namespace, parent: Path, td_folder: Path, run_nam
         work.mkdir(parents=True, exist_ok=True)
         shutil.copy2(executable, work / "dmrg")
         restart = f"../../{a.gs_filename.resolve().name}" if step == 1 else f"../../{run_name}/Recovery{step - 2}{run_name}"
-        (work / f"input_twotime_{run_name}_apply.ain").write_text(apply_input(a, output, times[step], pump[step], restart, creator), encoding="utf-8")
+        # G< applies annihilation and measures creation; G> does the reverse.
+        (work / f"input_twotime_{run_name}_apply.ain").write_text(apply_input(a, output, times[step], pump[step], restart, not creator), encoding="utf-8")
         (work / f"input_twotime_{run_name}_evolve_forward.ain").write_text(evolve_input(a, output, times, pump, step, True), encoding="utf-8")
         (work / f"input_twotime_{run_name}_evolve_backward.ain").write_text(evolve_input(a, output, times, pump, step, False), encoding="utf-8")
     return folder
@@ -194,7 +197,9 @@ def write_batch(a: argparse.Namespace, td_folder: Path, gless: Path, ggreater: P
     """Write one allocation: TD is streamed while paired G tasks consume recoveries."""
     path = td_folder / f"batch_streamed_td_G_{run_name}.slurm"
     nodes = 1 + a.g_worker_nodes
-    # The shell never starts step n>0 until TD's Recovery(n-1) is visible.
+    post_commands = postprocess_commands(a, td_folder, gless, ggreater, run_name)
+    td_post, less_post, greater_post = (shlex.join(command) for command in post_commands)
+    # A later recovery appearing means TD has closed the prior recovery.
     body = f'''#!/bin/bash
 #SBATCH --account=m5228
 #SBATCH --qos=regular
@@ -203,7 +208,7 @@ def write_batch(a: argparse.Namespace, td_folder: Path, gless: Path, ggreater: P
 #SBATCH --ntasks={nodes}
 #SBATCH --cpus-per-task={a.cpus_per_task}
 #SBATCH --gpus-per-task=4
-#SBATCH --time=48:00:00
+#SBATCH --time=16:00:00
 #SBATCH --job-name=dmrg_td_streamed_g
 #SBATCH --output=%x-%j.out
 #SBATCH --error=%x-%j.err
@@ -230,11 +235,40 @@ POLL_SECONDS={a.recovery_poll_seconds}
 SETTLE_SECONDS={a.recovery_settle_seconds}
 PRECISION={DMRG_PRECISION}
 
+# Initialize a status for every planned step before launching TD.
+for (( step=0; step<TIME_STEPS; ++step )); do
+  step_name="step_$(printf '%04d' "$step")"
+  printf '%s\\n' 'not started' > "$GLESS_FOLDER/$step_name/.g_pipeline_status"
+  printf '%s\\n' 'not started' > "$GGREATER_FOLDER/$step_name/.g_pipeline_status"
+done
+write_failure_report() {{
+  local status="$?" folder step_name state step
+  local report="$TD_FOLDER/failed_g_steps.txt"
+  trap - EXIT
+  : > "$report"
+  for folder in "$GLESS_FOLDER" "$GGREATER_FOLDER"; do
+    for (( step=0; step<TIME_STEPS; ++step )); do
+      step_name="step_$(printf '%04d' "$step")"
+      state=$(<"$folder/$step_name/.g_pipeline_status") || state="unknown"
+      if [[ "$state" != complete ]]; then
+        printf '%s\\t%s\\n' "$state" "$folder/$step_name" >> "$report"
+      fi
+    done
+  done
+  if [[ -s "$report" ]]; then
+    echo "Incomplete G steps listed in $report" >&2
+  fi
+  exit "$status"
+}}
+trap write_failure_report EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+
 # TD permanently occupies one node. Its exit status is checked at the end.
 (
   cd "$TD_FOLDER"
   srun --exclusive --nodes=1 --ntasks=1 --cpus-per-task="$CPUS_PER_TASK" \\
-    ./dmrg -f "input_td_${{RUN_NAME#td_}}.ain" -p "$PRECISION" "{TD_OPERATORS}"
+    ./dmrg -f {shlex.quote('input_td_' + run_name.removeprefix('td_').removesuffix('_' + frequency_tag(a.pump_frequency)) + '.ain')} -p "$PRECISION" "{TD_OPERATORS}"
 ) >"$TD_FOLDER/td_streamed.stdout" 2>"$TD_FOLDER/td_streamed.stderr" &
 TD_PID=$!
 
@@ -245,14 +279,24 @@ launch_g_step() {{
   local step="$2"
   local apply_op="$3"
   local twotime_op="$4"
+  local step_folder="$folder/step_$(printf '%04d' "$step")"
+  printf '%s\\n' running > "$step_folder/.g_pipeline_status"
   (
-    cd "$folder/step_$(printf '%04d' "$step")"
-    srun --exclusive --nodes=1 --ntasks=1 --cpus-per-task="$CPUS_PER_TASK" \\
-      ./dmrg -f "input_twotime_${{RUN_NAME}}_apply.ain" -p "$PRECISION" "$apply_op"
-    srun --exclusive --nodes=1 --ntasks=1 --cpus-per-task="$CPUS_PER_TASK" \\
-      ./dmrg -f "input_twotime_${{RUN_NAME}}_evolve_forward.ain" -p "$PRECISION" "$twotime_op"
-    srun --exclusive --nodes=1 --ntasks=1 --cpus-per-task="$CPUS_PER_TASK" \\
-      ./dmrg -f "input_twotime_${{RUN_NAME}}_evolve_backward.ain" -p "$PRECISION" "$twotime_op"
+    cd "$step_folder" || exit 1
+    if srun --exclusive --nodes=1 --ntasks=1 --cpus-per-task="$CPUS_PER_TASK" \\
+          bash -c '
+            set -e
+            run_name="$1"; precision="$2"; apply_op="$3"; twotime_op="$4"
+            ./dmrg -f "input_twotime_${{run_name}}_apply.ain" -p "$precision" "$apply_op"
+            ./dmrg -f "input_twotime_${{run_name}}_evolve_forward.ain" -p "$precision" "$twotime_op"
+            ./dmrg -f "input_twotime_${{run_name}}_evolve_backward.ain" -p "$precision" "$twotime_op"
+          ' _ "$RUN_NAME" "$PRECISION" "$apply_op" "$twotime_op"; then
+      printf '%s\\n' complete > .g_pipeline_status
+      exit 0
+    fi
+    echo "G pipeline failed: $folder step $step" >&2
+    printf '%s\\n' failed > .g_pipeline_status
+    exit 1
   ) >"$folder/step_$(printf '%04d' "$step")/streamed.stdout" \\
     2>"$folder/step_$(printf '%04d' "$step")/streamed.stderr" &
   G_PIDS+=("$!")
@@ -260,13 +304,13 @@ launch_g_step() {{
 }}
 
 reap_one() {{
-  local done_pid pid
-  wait -n -p done_pid "${{G_PIDS[@]}}"
-  local remaining=()
-  for pid in "${{G_PIDS[@]}}"; do
-    [[ "$pid" == "$done_pid" ]] || remaining+=("$pid")
-  done
-  G_PIDS=("${{remaining[@]}}")
+  # Portable to older Bash: wait for the oldest tracked G pipeline.
+  # Other pipelines continue running while this one is awaited.
+  local pid="${{G_PIDS[0]}}"
+  if ! wait "$pid"; then
+    echo "G pipeline failed (PID $pid); continuing other steps" >&2
+  fi
+  G_PIDS=("${{G_PIDS[@]:1}}")
   active=$((active - 1))
 }}
 wait_for_pair_slots() {{
@@ -274,14 +318,27 @@ wait_for_pair_slots() {{
 }}
 wait_for_recovery() {{
   local recovery="$1"
-  while [[ ! -e "$recovery" ]]; do
+  local next_recovery="$2"
+  while [[ ! -e "$next_recovery" ]]; do
     if ! kill -0 "$TD_PID" 2>/dev/null; then
-      wait "$TD_PID"
-      echo "TD stopped before required recovery appeared: $recovery" >&2
-      exit 1
+      # If TD finished successfully, its final recovery is closed even when
+      # no subsequent recovery exists. A failed TD must stop the workflow.
+      if ! wait "$TD_PID"; then
+        echo "TD failed before recovery was ready: $recovery" >&2
+        exit 1
+      fi
+      if [[ ! -e "$recovery" ]]; then
+        echo "TD completed without required recovery: $recovery" >&2
+        exit 1
+      fi
+      return
     fi
     sleep "$POLL_SECONDS"
   done
+  if [[ ! -e "$recovery" ]]; then
+    echo "Next recovery exists but required recovery is missing: $recovery" >&2
+    exit 1
+  fi
   sleep "$SETTLE_SECONDS"
 }}
 
@@ -291,9 +348,11 @@ wait_for_pair_slots
 launch_g_step "$GLESS_FOLDER" 0 "<P0|c'|P1>" "<P2|c'|P3>"
 launch_g_step "$GGREATER_FOLDER" 0 "<P0|c|P1>" "<P2|c|P3>"
 
-# step 0001 consumes Recovery0RUN_NAME; step 0002 consumes Recovery1RUN_NAME; etc.
+# Wait for the next recovery to appear, indicating the required one is closed.
+# If there is no next recovery, successful TD completion is the fallback.
 for (( step=1; step<TIME_STEPS; ++step )); do
-  wait_for_recovery "$TD_FOLDER/Recovery$((step - 1))$RUN_NAME"
+  wait_for_recovery "$TD_FOLDER/Recovery$((step - 1))$RUN_NAME" \\
+    "$TD_FOLDER/Recovery${{step}}$RUN_NAME"
   wait_for_pair_slots
   launch_g_step "$GLESS_FOLDER" "$step" "<P0|c'|P1>" "<P2|c'|P3>"
   launch_g_step "$GGREATER_FOLDER" "$step" "<P0|c|P1>" "<P2|c|P3>"
@@ -301,16 +360,47 @@ done
 
 while (( active > 0 )); do reap_one; done
 wait "$TD_PID"
-echo "TD and all streamed G< / G> step pipelines completed."
+FAILURE_LOG="$TD_FOLDER/failed_g_steps.txt"
+less_failed=0
+greater_failed=0
+for (( step=0; step<TIME_STEPS; ++step )); do
+  step_name="step_$(printf '%04d' "$step")"
+  [[ $(<"$GLESS_FOLDER/$step_name/.g_pipeline_status") == complete ]] || less_failed=1
+  [[ $(<"$GGREATER_FOLDER/$step_name/.g_pipeline_status") == complete ]] || greater_failed=1
+done
+{td_post}
+if (( ! less_failed )); then {less_post}; else echo "Skipping incomplete G< post-processing" >&2; fi
+if (( ! greater_failed )); then {greater_post}; else echo "Skipping incomplete G> post-processing" >&2; fi
+if (( less_failed || greater_failed )); then
+  echo "Incomplete G steps will be listed in $FAILURE_LOG" >&2
+  exit 1
+fi
+echo "TD and all streamed G< / G> step pipelines completed and post-processed."
 '''
     path.write_text(body, encoding="utf-8")
     return path
 
 
+def postprocess_commands(a: argparse.Namespace, td_folder: Path, gless: Path, ggreater: Path, run_name: str) -> list[list[str]]:
+    """Build commands for the existing TD and two-time output processors."""
+    scripts = Path(__file__).resolve().parent
+    pump = str(td_folder / "pump_table.csv")
+    td_output = td_folder / f"runForinput_td_{run_name.removeprefix('td_').removesuffix('_' + frequency_tag(a.pump_frequency))}.cout"
+    commands = [["python3", str(scripts / "my_hubbard_chain_td_targetingexpression_process.py"), str(td_output), pump]]
+    for prefix, folder in (("G<", gless), ("G>", ggreater)):
+        commands.append([
+            "python3", str(scripts / f"my_hubbard_chain_twotime_{prefix}_parallel_process.py"),
+            str(a.center_site), str(a.gs_filename.resolve()), pump, str(folder), "--workers", "1",
+        ])
+    return commands
+
+
 def run_serial(a: argparse.Namespace, td_folder: Path, td_input_path: Path, gless: Path, ggreater: Path, run_name: str) -> None:
     """Run TD, then each G< and G> step sequentially on the current node."""
     environment = os.environ.copy()
-    environment["OMP_NUM_THREADS"] = str(max(1, a.cpus_per_task // 2))
+    environment["OMP_NUM_THREADS"] = str(
+        max(1, a.cpus_per_task // 2) if a.cluster == "nersc" else a.cpus_per_task
+    )
     environment.setdefault("OMP_PLACES", "cores")
     environment.setdefault("OMP_PROC_BIND", "spread")
 
@@ -321,16 +411,54 @@ def run_serial(a: argparse.Namespace, td_folder: Path, td_input_path: Path, gles
             cwd=work, env=environment, check=True,
         )
 
+    all_steps = [folder / f"step_{step:04d}" for folder in (gless, ggreater) for step in range(a.Pump_time_steps)]
+    for work in all_steps:
+        (work / ".g_pipeline_status").write_text("not started\n", encoding="utf-8")
+
+    def write_failure_report() -> None:
+        lines = []
+        for work in all_steps:
+            try:
+                state = (work / ".g_pipeline_status").read_text(encoding="utf-8").strip()
+            except OSError:
+                state = "unknown"
+            if state != "complete":
+                lines.append(f"{state}\t{work}\n")
+        failure_log = td_folder / "failed_g_steps.txt"
+        failure_log.write_text("".join(lines), encoding="utf-8")
+        if lines:
+            print(f"Incomplete G steps listed in {failure_log}", flush=True)
+
+    atexit.register(write_failure_report)
     run(td_folder, td_input_path.name, TD_OPERATORS)
+    failed_steps = []
     for step in range(a.Pump_time_steps):
         for folder, apply_op, evolve_op in (
             (gless, "<P0|c'|P1>", "<P2|c'|P3>"),
             (ggreater, "<P0|c|P1>", "<P2|c|P3>"),
         ):
             work = folder / f"step_{step:04d}"
-            for stage, operator in (("apply", apply_op), ("evolve_forward", evolve_op), ("evolve_backward", evolve_op)):
-                run(work, f"input_twotime_{run_name}_{stage}.ain", operator)
-    print("TD and all serial G< / G> step pipelines completed.")
+            (work / ".g_pipeline_status").write_text("running\n", encoding="utf-8")
+            try:
+                for stage, operator in (("apply", apply_op), ("evolve_forward", evolve_op), ("evolve_backward", evolve_op)):
+                    run(work, f"input_twotime_{run_name}_{stage}.ain", operator)
+                (work / ".g_pipeline_status").write_text("complete\n", encoding="utf-8")
+            except subprocess.CalledProcessError:
+                (work / ".g_pipeline_status").write_text("failed\n", encoding="utf-8")
+                failed_steps.append(work)
+                print(f"G pipeline failed for {work}; continuing other steps.", flush=True)
+    failure_log = td_folder / "failed_g_steps.txt"
+    write_failure_report()
+    commands = postprocess_commands(a, td_folder, gless, ggreater, run_name)
+    subprocess.run(commands[0], check=True)
+    for folder, command in zip((gless, ggreater), commands[1:]):
+        if any(work.parent == folder for work in failed_steps):
+            print(f"Skipping incomplete post-processing: {folder}", flush=True)
+        else:
+            subprocess.run(command, check=True)
+    if failed_steps:
+        raise RuntimeError(f"Failed G steps to rerun are listed in {failure_log}")
+    print("TD and all serial G< / G> step pipelines completed and post-processed.")
 
 
 def main() -> int:
@@ -363,16 +491,17 @@ def main() -> int:
 
     gless = write_g_inputs(a, parent, td_folder, run_name, times, pump, True, executable)
     ggreater = write_g_inputs(a, parent, td_folder, run_name, times, pump, False, executable)
-    batch = write_batch(a, td_folder, gless, ggreater, run_name)
+    batch = write_batch(a, td_folder, gless, ggreater, run_name) if a.cluster == "nersc" else None
     print(f"Created TD folder: {td_folder}")
     print(f"Created G< folder: {gless}")
     print(f"Created G> folder: {ggreater}")
-    print(f"Wrote streamed batch script: {batch}")
+    if batch is not None:
+        print(f"Wrote streamed batch script: {batch}")
     if a.submit:
         subprocess.run(["sbatch", str(batch)], cwd=td_folder, check=True)
     elif a.run:
-        if not os.environ.get("SLURM_JOB_ID"):
-            raise ValueError("--run requires an interactive Slurm compute-node allocation")
+        if a.cluster == "nersc" and not os.environ.get("SLURM_JOB_ID"):
+            raise ValueError("--run on NERSC requires an interactive Slurm compute-node allocation")
         run_serial(a, td_folder, td_input_path, gless, ggreater, run_name)
     return 0
 
