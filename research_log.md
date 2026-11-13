@@ -29,10 +29,11 @@ Gonzalo put in a fix for automatic restart; it didn't test correctly; will need 
 
 __2026-11-10 - Batch scripts now use N-2, are padded with values at ends to get all sites and TD and G inputs can be generated together and run.__
 
-__2026-11-12 - Automatic restart now works__: There maybe an additional issue that showed up on NERSC but I haven't tested it yet. 
+__2026-11-12 - Automatic restart now works__: There maybe an additional issue that showed up on NERSC but I haven't tested it yet.
 
-__2026-11-12 - Gonzalo implemented startLoop__ : The Hamiltonian looks for t=0 for non-time loops it doesn't help with my workflow. 
+__2026-11-12 - Gonzalo implemented startLoop__ : The Hamiltonian looks for t=0 for non-time loops it doesn't help with my workflow.
 
+__2026-11-13 - Automatic restart additonal issue has been reported and a fix by Gonzalo needs to be tested__: Maybe not as important but to be checked. 
 
 ## Data
 
@@ -40,11 +41,11 @@ __2026-10-02 - 4-site and 8-site calculations are running.__: Data has been adde
 
 __2026-11-08 - 12-site runs for GPU scheduled on NERSC.__: This atleast can go on manuscript if I cannot go higher. ED runs are at 10 sites. 12 site runs are for Tmax=50 and Tmax=100 with delta_t=0.1. Kokkos_Threads is used. 
 
-__2026-11-10 - Massively parallel 12-site runs for GPU scheduled on NERSC__: Just queued; won't run until the weekend or longer. The automatic restart is included but I expect that it won't be needed. 
+__2026-11-10 - Massively parallel 12-site runs for GPU scheduled on NERSC__: Just queued; won't run until the weekend or longer. The automatic restart is included but I expect that it won't be needed.
 
 __2026-11-12 - Parallel runs takes a long time to start__: NERSC only allows two jobs to accrue priority by time so the rest acts as if they were just submitted. Need to rethink this workflow!
 
-__2026-11-13 - 16 site jobs started but not actively tracking__: Testing to see how this performs; I think this is also doable in the 48 hour window. 
+__2026-11-13 - Massively parallel 12-site runs for GPU scheduled on NERSC__: The former runs have been cancelled and a new 1000 node job has been queued to run for 12 site that does td and twotime together. 
 
 ## Home
 
