@@ -18,11 +18,16 @@ __2026-10-05 - P_threads for dmrg++ internal have segmentation fault issues__: L
 
 __2026-10-14 - Added tests for CPU vs GPU for performance checks__: Tested on NERSC Perlmutter.
 
-__2026-10-20 - Tested GPUs with magma__: GPU's are faster. Magma needs a PR for Krylove Time Evolution. Fix implemented with Codex in my personal fork of dmrg++. PR for this added as a future task.
+__2026-10-20 - Tested GPUs with magma__: GPU's are faster. Magma needs a PR for Krylov Time Evolution. Fix implemented with Codex in my personal fork of dmrg++. PR for this added as a future task.
 
 __2026-11-08 - GPU testing on NERSC with 12-site runs__: dmrg++ compiles with Release on NERSC without issues. Kokkos with threads is the fastest followed by Kokkos with openmp and Kokkos with serial for GPU runs. Multi-gpu runs failed.
 
-__2026-11-09 - Backward Time Evolution with Gonzalo__: Gonzalo put in a fix but the tests reveal a new issue in apply stage that was not caught before. Probably wasn't caught from my earlier versions of code from copy_dmrg either. 
+__2026-11-09 - Backward Time Evolution with Gonzalo__: Gonzalo put in a fix which I tested locally and on NERSC.
+
+__2026-11-10 - Automatic restart with Gonzalo__: 
+Gonzalo put in a fix for automatic restart; it didn't test correctly; will need additional fix.
+
+__2026-11-10 - Batch scripts now use N-2, are padded with values at ends to get all sites and TD and G inputs can be generated together and run.__
 
 ## Data
 
@@ -30,18 +35,24 @@ __2026-10-02 - 4-site and 8-site calculations are running.__: Data has been adde
 
 __2026-11-08 - 12-site runs for GPU scheduled on NERSC.__: This atleast can go on manuscript if I cannot go higher. ED runs are at 10 sites. 12 site runs are for Tmax=50 and Tmax=100 with delta_t=0.1. Kokkos_Threads is used. 
 
+__2026-11-10 - Massively parallel 12-site runs for GPU scheduled on NERSC__: Just queued; won't run until the weekend or longer. The automatic restart is included but I expect that it won't be needed. 
+
+
 ## Home
 
-__2026-11-08 - Reorganized project directory.__ Moved markdown notes here instead of Zettler.__
+__2026-11-08 - Reorganized project directory.__ Moved markdown notes here instead of Zettler.
 
 ## Reading
 
 ## Updates
 
-__2026-11-06 - Thomas sked to run more GPU jobs to keep NERSC hours.__ Needs updated scripts with TSPAdvanceEach=N-2.
+__2026-11-06 - Thomas asked to run more GPU jobs to keep NERSC hours.__ Needs updated scripts with TSPAdvanceEach=N-2.
 
 ## Writing
 
 ## Things to remember
 
 - In the TspAdvanceEach = N-2, the first time step never has all the sites. Time is changed at the boundary and since the first loop starts at the second or second to last site, the border site is always missing. Important for momentum-resolved measurements.
+- Scripts now use N-2; the equal $t=t^\prime$ are calculated on apply stage while the others in the time evolution.
+- Timeaxis are padded (at both ends) so that the border-sites are now computed and available in the Fourier transform.
+

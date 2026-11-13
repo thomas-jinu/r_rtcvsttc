@@ -1,0 +1,296 @@
+"""Post-process a completed two-time Hubbard-chain calculation."""
+
+import argparse
+import csv
+import os
+import re
+from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
+
+TWOTIME_OPERATOR_LABEL = "<P2|c'|P3>"
+APPLY_OPERATOR_LABEL = "<P0|c'|P1>"
+
+TWOTIME_COLLECTION_MARKER = "FiniteLoops printing ends"
+
+TWOTIME_NUMBER_PATTERN = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
+
+def operator_pattern(operator_label: str) -> re.Pattern[str]:
+    """Build the output-line pattern for an operator label."""
+    return re.compile(
+        rf"^\s*(\d+)\s+"
+        rf"\(\s*({TWOTIME_NUMBER_PATTERN})\s*,\s*({TWOTIME_NUMBER_PATTERN})\s*\)\s+"
+        rf"({TWOTIME_NUMBER_PATTERN})\s+"
+        rf"{re.escape(operator_label)}"
+    )
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Generate and optionally run a DMRG++ Hubbard-chain calculation.",
+    )
+    parser.add_argument("center_site", type=int, help="Center site index")
+    parser.add_argument("gs_filename", type=Path, help="Ground-state file location")
+    parser.add_argument("pump_file", type=Path, help="Path to the pump file")
+    parser.add_argument(
+        "process_folder",
+        type=Path,
+        help="Only process an existing twotime_RUN_NAME directory.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=os.cpu_count() or 1,
+        help="Number of output files to parse concurrently (default: CPU count).",
+    )
+    args = parser.parse_args()
+    if args.workers < 1:
+        parser.error("--workers must be at least 1")
+    return args
+
+
+def read_pump_file(pump_file_path: Path) -> tuple[list[float], list[float]]:
+    """Read the pump file and return the list of pump values."""
+    time = []
+    pump = []
+
+    with open(pump_file_path, "r") as file:
+        reader = csv.DictReader(file)
+
+        for row in reader:
+            time.append(float(row["time"]))
+            pump.append(float(row["pump"]))
+
+    return time, pump
+
+
+def find_apply_output(step_folder: Path, run_name: str) -> Path:
+    """Find the DMRG++ apply-stage output file for one step."""
+    output_path = step_folder / f"runForinput_{run_name}_apply.cout"
+    if output_path.is_file():
+        return output_path
+    raise FileNotFoundError(f"No apply-stage output found in {step_folder}")
+
+
+def find_evolve_output_forward(step_folder: Path, run_name: str) -> Path:
+    """Find the DMRG++ forward-evolve output file for one step."""
+    output_path = step_folder / f"runForinput_{run_name}_evolve_forward.cout"
+    if output_path.is_file():
+        return output_path
+    raise FileNotFoundError(f"No forward evolve output found in {step_folder}")
+
+
+def find_evolve_output_backward(step_folder: Path, run_name: str) -> Path:
+    """Find the DMRG++ backward-evolve output file for one step."""
+    output_path = step_folder / f"runForinput_{run_name}_evolve_backward.cout"
+    if output_path.is_file():
+        return output_path
+    raise FileNotFoundError(f"No backward evolve output found in {step_folder}")
+
+
+def read_operator_output(
+    output_path: Path,
+    operator_label: str = TWOTIME_OPERATOR_LABEL,
+) -> list[tuple[int, float, float, float]]:
+    """Read operator data after ``FiniteLoops printing ends``."""
+    rows_by_key = {}
+    collecting = False
+    pattern = operator_pattern(operator_label)
+
+    with output_path.open("r", encoding="utf-8") as file:
+        for line in file:
+            if TWOTIME_COLLECTION_MARKER in line:
+                collecting = True
+                continue
+            if not collecting or operator_label not in line:
+                continue
+
+            match = pattern.search(line)
+            if match is None:
+                continue
+
+            site_index = int(match.group(1))
+            real_part = float(match.group(2))
+            imaginary_part = float(match.group(3))
+            time = float(match.group(4))
+
+            # If the same site/time appears again, keep the last value.
+            rows_by_key[(site_index, time)] = [
+                site_index,
+                real_part,
+                imaginary_part,
+                time,
+            ]
+
+    return [
+        (site, real_part, imaginary_part, time)
+        for site, real_part, imaginary_part, time in rows_by_key.values()
+    ]
+
+
+def collect_step_data(
+    step: int,
+    twotime_folder: Path,
+    run_name: str,
+    time_axis: list[float],
+    center_site: int,
+) -> dict[tuple[float, float, int, int], complex]:
+    """Read the forward and backward results for one physical time step."""
+    step_folder = twotime_folder / f"step_{step:04d}"
+    t_prime = float(time_axis[step + 1])
+    data = {}
+
+    for output_path in (
+        find_evolve_output_forward(step_folder, run_name),
+        find_evolve_output_backward(step_folder, run_name),
+    ):
+        for site, real_part, imaginary_part, time in read_operator_output(output_path):
+            key = (t_prime, float(time), int(center_site), int(site))
+            data[key] = complex(real_part, imaginary_part)
+
+    # Apply-stage values are equal-time values; retain evolve results when present
+    # and use the apply stage to fill an edge value missing from the evolution sweep.
+    for site, real_part, imaginary_part, _ in read_operator_output(
+        find_apply_output(step_folder, run_name), APPLY_OPERATOR_LABEL
+    ):
+        key = (t_prime, t_prime, int(center_site), int(site))
+        data.setdefault(key, complex(real_part, imaginary_part))
+
+    return data
+
+
+def collect_twotime_data(
+    twotime_folder: Path,
+    run_name: str,
+    number_of_steps: int,
+    time_axis: list[float],
+    center_site: int,
+    workers: int,
+) -> dict[tuple[float, float, int, int], complex]:
+    """Read physical time steps concurrently and merge their Green's-function data."""
+    data = {}
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        step_data_sets = executor.map(
+            collect_step_data,
+            range(number_of_steps),
+            [twotime_folder] * number_of_steps,
+            [run_name] * number_of_steps,
+            [time_axis] * number_of_steps,
+            [center_site] * number_of_steps,
+        )
+        for step_data in step_data_sets:
+            data.update(step_data)
+
+    return data
+
+
+def save_twotime_csv(
+    data: dict[tuple[float, float, int, int], complex],
+    output_path: Path,
+) -> None:
+    """
+    Save two-time Green's-function data to CSV.
+
+    Dictionary format:
+        {
+            (t_prime, t, center_site, site): complex_value
+        }
+    """
+    with output_path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.writer(file)
+
+        writer.writerow(
+            [
+                "t_prime",
+                "t",
+                "center_site",
+                "site_index",
+                "real_part",
+                "imaginary_part",
+            ]
+        )
+
+        for (t_prime, time, center_site, site), value in sorted(data.items()):
+            writer.writerow(
+                [
+                    f"{t_prime:.15g}",
+                    f"{time:.15g}",
+                    center_site,
+                    site,
+                    f"{value.real:.15g}",
+                    f"{value.imag:.15g}",
+                ]
+            )
+
+
+def process_twotime_results(
+    base_directory: Path,
+    run_name: str,
+    number_of_steps: int,
+    time_axis,
+    center_site: int,
+    workers: int,
+) -> Path:
+    """Collect an existing run and write its combined CSV file."""
+    twotime_folder = base_directory / f"{run_name}"
+
+    if not twotime_folder.is_dir():
+        raise FileNotFoundError(f"Two-time run folder not found: {twotime_folder}")
+    if number_of_steps != len(time_axis) - 2:
+        raise ValueError("number_of_steps must equal the physical pump-time count")
+
+    missing_step_folders = [
+        f"step_{step:04d}"
+        for step in range(number_of_steps)
+        if not (twotime_folder / f"step_{step:04d}").is_dir()
+    ]
+    if missing_step_folders:
+        raise FileNotFoundError(
+            "Missing step folders: " + ", ".join(missing_step_folders)
+        )
+
+    data = collect_twotime_data(
+        twotime_folder=twotime_folder,
+        run_name=run_name.split("_", 1)[-1],  # Remove Gless from name,
+        number_of_steps=number_of_steps,
+        time_axis=time_axis,
+        center_site=center_site,
+        workers=workers,
+    )
+
+    csv_path = base_directory / f"{run_name}_P2_c_P3_centersite={center_site}.csv"
+
+    save_twotime_csv(
+        data=data,
+        output_path=csv_path,
+    )
+
+    return csv_path
+
+
+def main() -> int:
+    """Collect completed two-time results into a CSV file."""
+    args = parse_args()
+
+    restart_path = args.gs_filename.resolve()
+    time_axis, _pump_axis = read_pump_file(args.pump_file)
+    if len(time_axis) < 3:
+        raise ValueError("Pump file must contain physical times and both paddings")
+
+    csv_path = process_twotime_results(
+        base_directory=restart_path.parent,
+        run_name=args.process_folder.name,
+        number_of_steps=len(time_axis) - 2,
+        time_axis=time_axis,
+        center_site=args.center_site,
+        workers=args.workers,
+    )
+    print(f"Wrote post-processed data: {csv_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (ValueError, FileNotFoundError) as error:
+        raise SystemExit(f"Error: {error}")
