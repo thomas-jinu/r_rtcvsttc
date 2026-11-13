@@ -369,8 +369,7 @@ def main() -> int:
     print(f"Created G> folder: {ggreater}")
     print(f"Wrote streamed batch script: {batch}")
     if a.submit:
-        result = subprocess.run(["sbatch", "--parsable", str(batch)], cwd=td_folder, check=True, capture_output=True, text=True)
-        print(f"Submitted streamed TD/G workflow: {result.stdout.strip()}")
+        subprocess.run(["sbatch", str(batch)], cwd=td_folder, check=True)
     elif a.run:
         if not os.environ.get("SLURM_JOB_ID"):
             raise ValueError("--run requires an interactive Slurm compute-node allocation")
