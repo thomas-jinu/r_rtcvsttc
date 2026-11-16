@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a streamed, single-allocation TD -> G< / G> Hubbard-chain workflow.
-
-TD runs on one node.  As each TD recovery file becomes available, one exclusive
-node runs the complete G< step and another runs the complete G> step:
-apply -> forward evolution -> backward evolution.  The original TD and G
-scripts are deliberately not used or modified by this script.
-"""
+"""Generate separate TD and dependent combined G< / G> Slurm jobs."""
 
 import argparse
 import atexit
@@ -22,7 +16,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 DMRG_EXECUTABLES = {
-    "local": Path("/Users/qqt/Documents/Codes/dmrgpp_backwardevolve/copy_dmrg/build/dmrg/dmrg"),
+    "local": Path("/Users/qqt/Documents/Codes/dmrgpp_alltimerecovery_fixes/dmrgpp/build/dmrg/dmrg"),
     "nersc": Path("/pscratch/sd/t/thomasj2/r_rtcvsttc/data/2026_november/10_4sitetestruns_GPU/copy_dmrg/build_perlmutter_nvidia_cuda/dmrg/dmrg"),
 }
 DMRG_PRECISION = 12
@@ -32,7 +26,7 @@ NUMBER = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Create one streamed TD + G< + G> Slurm workflow.")
+    p = argparse.ArgumentParser(description="Create TD and dependent combined G< + G> Slurm jobs.")
     p.add_argument("sites", type=int)
     p.add_argument("up", type=int)
     p.add_argument("down", type=int)
@@ -51,6 +45,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("center_site", type=int)
     p.add_argument("finite_loops_apply", type=int)
     p.add_argument("--pump-frequency", type=float, required=True)
+    p.add_argument("--restart-td", type=Path, help="Continue a previous TD folder with Pump_time_steps as the new total")
     execution = p.add_mutually_exclusive_group()
     execution.add_argument("--submit", action="store_true", help="Submit the generated Slurm batch script")
     execution.add_argument("--run", action="store_true", help="Run TD and all G steps serially on the current compute node")
@@ -58,18 +53,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--g-worker-nodes", type=int, default=None,
         help="Exclusive nodes available to G work (default: 2 per time step).",
-    )
-    p.add_argument(
-        "--initial-g-delay", type=int, default=60,
-        help="Seconds to wait after TD starts before launching G step 0000 (default: 60).",
-    )
-    p.add_argument(
-        "--recovery-poll-seconds", type=int, default=30,
-        help="Seconds between checks for the next TD recovery file (default: 30).",
-    )
-    p.add_argument(
-        "--recovery-settle-seconds", type=int, default=30,
-        help="Extra seconds to wait after the next recovery file appears (default: 30).", 
     )
     return p.parse_args()
 
@@ -83,8 +66,8 @@ def validate(a: argparse.Namespace) -> None:
         raise ValueError("Pump_time_steps, finite_kept, and finite_loops_apply must be positive")
     if not 0 <= a.center_site < a.sites:
         raise ValueError("center_site must be a valid site index")
-    if a.cpus_per_task < 1 or a.initial_g_delay < 0 or a.recovery_poll_seconds < 1 or a.recovery_settle_seconds < 0:
-        raise ValueError("Invalid worker, delay, or polling value")
+    if a.cpus_per_task < 1:
+        raise ValueError("cpus-per-task must be positive")
     if a.g_worker_nodes is None:
         a.g_worker_nodes = 2 * a.Pump_time_steps
     if a.g_worker_nodes < 2:
@@ -193,10 +176,43 @@ def write_g_inputs(a: argparse.Namespace, parent: Path, td_folder: Path, run_nam
     return folder
 
 
+def write_td_batch(a: argparse.Namespace, td_folder: Path, input_path: Path) -> Path:
+    """Create the one-node TD Slurm job."""
+    path = td_folder / f"batch_td_{td_folder.name}.slurm"
+    body = f'''#!/bin/bash
+#SBATCH --account=m5228
+#SBATCH --qos=regular
+#SBATCH --constraint=gpu
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task={a.cpus_per_task}
+#SBATCH --gpus-per-task=4
+#SBATCH --time=16:00:00
+#SBATCH --job-name=dmrg_td
+#SBATCH --output=%x-%j.out
+#SBATCH --error=%x-%j.err
+set -euo pipefail
+module load cray-mpich/9.0.1
+module load cray-libsci/25.09.0
+module load cray-hdf5/1.14.3.7
+module load PrgEnv-nvidia
+module load cudatoolkit
+export OMP_NUM_THREADS={max(1, a.cpus_per_task // 2)}
+export OMP_PLACES=cores
+export OMP_PROC_BIND=spread
+cd {shlex.quote(str(td_folder))}
+srun --exclusive --nodes=1 --ntasks=1 --cpus-per-task={a.cpus_per_task} \\
+    ./dmrg -f {shlex.quote(input_path.name)} -p {DMRG_PRECISION} {shlex.quote(TD_OPERATORS)} \\
+    > td_streamed.stdout 2> td_streamed.stderr
+'''
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
 def write_batch(a: argparse.Namespace, td_folder: Path, gless: Path, ggreater: Path, run_name: str) -> Path:
-    """Write one allocation: TD is streamed while paired G tasks consume recoveries."""
-    path = td_folder / f"batch_streamed_td_G_{run_name}.slurm"
-    nodes = 1 + a.g_worker_nodes
+    """Create the combined G job, dependent on successful TD completion."""
+    path = td_folder / f"batch_combined_G_{run_name}.slurm"
+    nodes = a.g_worker_nodes
     post_commands = postprocess_commands(a, td_folder, gless, ggreater, run_name)
     td_post, less_post, greater_post = (shlex.join(command) for command in post_commands)
     # A later recovery appearing means TD has closed the prior recovery.
@@ -209,7 +225,7 @@ def write_batch(a: argparse.Namespace, td_folder: Path, gless: Path, ggreater: P
 #SBATCH --cpus-per-task={a.cpus_per_task}
 #SBATCH --gpus-per-task=4
 #SBATCH --time=16:00:00
-#SBATCH --job-name=dmrg_td_streamed_g
+#SBATCH --job-name=dmrg_combined_g
 #SBATCH --output=%x-%j.out
 #SBATCH --error=%x-%j.err
 
@@ -230,9 +246,6 @@ RUN_NAME="{run_name}"
 TIME_STEPS={a.Pump_time_steps}
 CPUS_PER_TASK={a.cpus_per_task}
 G_WORKER_NODES={a.g_worker_nodes}
-INITIAL_G_DELAY={a.initial_g_delay}
-POLL_SECONDS={a.recovery_poll_seconds}
-SETTLE_SECONDS={a.recovery_settle_seconds}
 PRECISION={DMRG_PRECISION}
 
 # Initialize a status for every planned step before launching TD.
@@ -263,14 +276,6 @@ write_failure_report() {{
 trap write_failure_report EXIT
 trap 'exit 143' TERM
 trap 'exit 130' INT
-
-# TD permanently occupies one node. Its exit status is checked at the end.
-(
-  cd "$TD_FOLDER"
-  srun --exclusive --nodes=1 --ntasks=1 --cpus-per-task="$CPUS_PER_TASK" \\
-    ./dmrg -f {shlex.quote('input_td_' + run_name.removeprefix('td_').removesuffix('_' + frequency_tag(a.pump_frequency)) + '.ain')} -p "$PRECISION" "{TD_OPERATORS}"
-) >"$TD_FOLDER/td_streamed.stdout" 2>"$TD_FOLDER/td_streamed.stderr" &
-TD_PID=$!
 
 active=0
 G_PIDS=()
@@ -316,50 +321,18 @@ reap_one() {{
 wait_for_pair_slots() {{
   while (( active + 2 > G_WORKER_NODES )); do reap_one; done
 }}
-wait_for_recovery() {{
-  local recovery="$1"
-  local next_recovery="$2"
-  while [[ ! -e "$next_recovery" ]]; do
-    if ! kill -0 "$TD_PID" 2>/dev/null; then
-      # If TD finished successfully, its final recovery is closed even when
-      # no subsequent recovery exists. A failed TD must stop the workflow.
-      if ! wait "$TD_PID"; then
-        echo "TD failed before recovery was ready: $recovery" >&2
-        exit 1
-      fi
-      if [[ ! -e "$recovery" ]]; then
-        echo "TD completed without required recovery: $recovery" >&2
-        exit 1
-      fi
-      return
-    fi
-    sleep "$POLL_SECONDS"
-  done
-  if [[ ! -e "$recovery" ]]; then
-    echo "Next recovery exists but required recovery is missing: $recovery" >&2
+# This batch must be submitted with an afterok dependency on TD.
+for (( step=0; step<TIME_STEPS; ++step )); do
+  if (( step > 0 )) && [[ ! -f "$TD_FOLDER/Recovery$((step - 1))$RUN_NAME.hd5" ]]; then
+    echo "Missing required TD recovery for step $step" >&2
     exit 1
   fi
-  sleep "$SETTLE_SECONDS"
-}}
-
-# Step 0000 restarts from the GS file. Start it only after the requested TD lead time.
-sleep "$INITIAL_G_DELAY"
-wait_for_pair_slots
-launch_g_step "$GLESS_FOLDER" 0 "<P0|c'|P1>" "<P2|c'|P3>"
-launch_g_step "$GGREATER_FOLDER" 0 "<P0|c|P1>" "<P2|c|P3>"
-
-# Wait for the next recovery to appear, indicating the required one is closed.
-# If there is no next recovery, successful TD completion is the fallback.
-for (( step=1; step<TIME_STEPS; ++step )); do
-  wait_for_recovery "$TD_FOLDER/Recovery$((step - 1))$RUN_NAME" \\
-    "$TD_FOLDER/Recovery${{step}}$RUN_NAME"
   wait_for_pair_slots
   launch_g_step "$GLESS_FOLDER" "$step" "<P0|c'|P1>" "<P2|c'|P3>"
   launch_g_step "$GGREATER_FOLDER" "$step" "<P0|c|P1>" "<P2|c|P3>"
 done
 
 while (( active > 0 )); do reap_one; done
-wait "$TD_PID"
 FAILURE_LOG="$TD_FOLDER/failed_g_steps.txt"
 less_failed=0
 greater_failed=0
@@ -471,15 +444,54 @@ def main() -> int:
     if not executable.is_file():
         raise FileNotFoundError(f"DMRG++ executable not found: {executable}")
 
-    stamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
-    run_base = f"N={a.sites}_Nup={a.up}_Ndown={a.down}_{stamp}"
     tag = frequency_tag(a.pump_frequency)
-    run_name = f"td_{run_base}_{tag}"
     parent = gs.parent
-    td_folder = parent / run_name
-    td_folder.mkdir(parents=True, exist_ok=True)
+    if a.restart_td:
+        td_folder = a.restart_td.resolve()
+        if not td_folder.is_dir() or td_folder.parent != parent:
+            raise ValueError("Restart TD folder must exist beside the original ground-state file")
+        arg_files = list(td_folder.glob("input_args_td_*.json"))
+        if len(arg_files) != 1:
+            raise ValueError("Restart TD folder must contain exactly one input_args_td_*.json")
+        previous = json.loads(arg_files[0].read_text(encoding="utf-8"))
+        if a.Pump_time_steps < previous["Pump_time_steps"]:
+            raise ValueError("Pump_time_steps cannot be less than the previous total")
+        for key, old in previous.items():
+            if key in {"Pump_time_steps", "submit", "run", "cpus_per_task", "g_worker_nodes", "restart_td"}:
+                continue
+            current = getattr(a, key, None)
+            if key == "gs_filename":
+                if Path(old).resolve() != gs:
+                    raise ValueError("Ground-state file differs from previous run")
+            elif current != old:
+                raise ValueError(f"{key} differs from previous run: {old!r} != {current!r}")
+        run_base = arg_files[0].name.removeprefix("input_args_td_").removesuffix(".json")
+        run_name = f"td_{run_base}_{tag}"
+        if td_folder.name != run_name:
+            raise ValueError("Previous TD folder name does not match its saved inputs")
+        if not list(td_folder.glob(f"Recovery*{run_name}.hd5")):
+            raise ValueError("No matching TD recovery files found")
+    else:
+        stamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+        run_base = f"N={a.sites}_Nup={a.up}_Ndown={a.down}_{stamp}"
+        run_name = f"td_{run_base}_{tag}"
+        td_folder = parent / run_name
+        td_folder.mkdir(parents=True, exist_ok=True)
     times = time_axis(a)
     pump = pump_axis(a, times)
+    if a.restart_td:
+        old_table = td_folder / "pump_table.csv"
+        if not old_table.is_file():
+            raise ValueError("Previous TD folder is missing pump_table.csv")
+        with old_table.open(newline="", encoding="utf-8") as file:
+            old_rows = list(csv.DictReader(file))
+        # Check every previous physical time, excluding the two padding rows.
+        new_values = {f"{time:.7f}": f"{value:.7f}" for time, value in zip(times, pump)}
+        for row in old_rows[1:-1]:
+            time = f"{float(row['time']):.7f}"
+            value = f"{float(row['pump']):.7f}"
+            if new_values.get(time) != value:
+                raise ValueError(f"New pump table does not match previous table at time {time}")
 
     values = {key: str(value) if isinstance(value, Path) else value for key, value in vars(a).items()}
     (td_folder / f"input_args_td_{run_base}.json").write_text(json.dumps(values, indent=2), encoding="utf-8")
@@ -492,13 +504,22 @@ def main() -> int:
     gless = write_g_inputs(a, parent, td_folder, run_name, times, pump, True, executable)
     ggreater = write_g_inputs(a, parent, td_folder, run_name, times, pump, False, executable)
     batch = write_batch(a, td_folder, gless, ggreater, run_name) if a.cluster == "nersc" else None
+    td_batch = write_td_batch(a, td_folder, td_input_path) if a.cluster == "nersc" else None
     print(f"Created TD folder: {td_folder}")
     print(f"Created G< folder: {gless}")
     print(f"Created G> folder: {ggreater}")
     if batch is not None:
-        print(f"Wrote streamed batch script: {batch}")
+        print(f"Wrote TD batch script: {td_batch}")
+        print(f"Wrote combined G batch script: {batch}")
     if a.submit:
-        subprocess.run(["sbatch", str(batch)], cwd=td_folder, check=True)
+        result = subprocess.run(["sbatch", str(td_batch)], cwd=td_folder, check=True, stdout=subprocess.PIPE, text=True)
+        print(result.stdout.strip(), flush=True)
+        match = re.search(r"Submitted batch job (\d+)", result.stdout)
+        if not match:
+            raise RuntimeError("TD submission succeeded but its job ID could not be parsed; check Slurm before resubmitting")
+        td_job_id = match.group(1)
+        print(f"Submitting G job dependent on TD job {td_job_id}", flush=True)
+        subprocess.run(["sbatch", f"--dependency=afterok:{td_job_id}", str(batch)], cwd=td_folder, check=True)
     elif a.run:
         if a.cluster == "nersc" and not os.environ.get("SLURM_JOB_ID"):
             raise ValueError("--run on NERSC requires an interactive Slurm compute-node allocation")
