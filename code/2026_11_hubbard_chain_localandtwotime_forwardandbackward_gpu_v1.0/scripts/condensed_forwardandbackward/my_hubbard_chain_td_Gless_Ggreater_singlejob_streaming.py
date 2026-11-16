@@ -17,7 +17,7 @@ from pathlib import Path
 
 DMRG_EXECUTABLES = {
     "local": Path("/Users/qqt/Documents/Codes/dmrgpp_alltimerecovery_fixes/dmrgpp/build/dmrg/dmrg"),
-    "nersc": Path("/pscratch/sd/t/thomasj2/r_rtcvsttc/data/2026_november/10_4sitetestruns_GPU/copy_dmrg/build_perlmutter_nvidia_cuda/dmrg/dmrg"),
+    "nersc": Path("/pscratch/sd/t/thomasj2/r_rtcvsttc/data/2026_november/14_12site_GPU_twotime/dmrgpp/build_perlmutter_nvidia_cuda/dmrg/dmrg"),
 }
 DMRG_PRECISION = 12
 TD_DEFINE_OPERATORS = "double:nup*ndown,hole:identity+(-1.0)*nup+(-1.0)*ndown+nup*ndown,parity:identity+(-2.0)*n+4.0*nup*ndown,local_moment:0.75*n+(-1.5)*nup*ndown"
@@ -85,9 +85,11 @@ def pump_axis(a: argparse.Namespace, times: list[float]) -> list[float]:
     values = []
     for time in times:
         value = a.Pump_Amplitude * math.exp(-0.5 * ((time - a.Pump_time_delay) / a.Pump_pulse_width) ** 2) * math.cos(a.pump_frequency * (time - a.Pump_time_delay))
+        if time == 0.0:
+            if abs(value) > 1e-7:
+                raise ValueError("Pump signal at time 0 must be within 1e-7 of zero")
+            value = 0.0
         values.append(round(value, 7) or 0.0)
-    if next(value for time, value in zip(times, values) if time == 0.0) != 0.0:
-        raise ValueError("Pump signal at time 0 must be zero")
     return values
 
 
