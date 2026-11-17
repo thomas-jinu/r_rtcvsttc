@@ -17,7 +17,7 @@ from pathlib import Path
 
 DMRG_EXECUTABLES = {
     "local": Path("/Users/qqt/Documents/Codes/dmrgpp_alltimerecovery_fixes/dmrgpp/build/dmrg/dmrg"),
-    "nersc": Path("/global/common/software/m5228/dmrgpp/installdir/bin/dmrg"),
+    "nersc": Path("/pscratch/sd/t/thomasj2/r_rtcvsttc/data/2026_november/14_12site_GPU_twotime/dmrgpp_fixrestart/dmrgpp/build_perlmutter_nvidia_cuda/dmrg/dmrg"),
 }
 DMRG_PRECISION = 12
 TD_DEFINE_OPERATORS = "double:nup*ndown,hole:identity+(-1.0)*nup+(-1.0)*ndown+nup*ndown,parity:identity+(-2.0)*n+4.0*nup*ndown,local_moment:0.75*n+(-1.5)*nup*ndown"
