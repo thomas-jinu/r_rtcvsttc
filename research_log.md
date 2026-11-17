@@ -39,6 +39,8 @@ __2026-11-15 - Additional fix for left to right sweep tested and still needs not
 
 __2026-11-15 - Depends workflow is complete so the apply stage has been eliminated__: Current 12-site runs are now scheduled with this. 
 
+__2026-11-16 - Gonzalo fixed the restart bug__: Tested locally and compiled on NERSC.
+
 ## Data
 
 __2026-10-02 - 4-site and 8-site calculations are running.__: Data has been added to folders.
@@ -52,6 +54,8 @@ __2026-11-12 - Parallel runs takes a long time to start__: NERSC only allows two
 __2026-11-13 - Massively parallel 12-site runs for GPU scheduled on NERSC__: The former runs have been cancelled and a new 1000 node job has been queued to run for 12 site that does td and twotime together.
 
 __2026-11-15 - Parallel runs were not starting on time and would have taken double the time for a single workflow__: td and twotime workflows have been separated and are now requeued on NERSC.
+
+__2026-11-16 - Restart fixed dmrg copied to the G folders__: Local tests show that restarts work just fine.
 
 ## Home
 
