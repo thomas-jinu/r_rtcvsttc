@@ -35,6 +35,10 @@ __2026-11-12 - Gonzalo implemented startLoop__ : The Hamiltonian looks for t=0 f
 
 __2026-11-13 - Automatic restart additonal issue has been reported and a fix by Gonzalo needs to be tested__: Maybe not as important but to be checked. 
 
+__2026-11-15 - Additional fix for left to right sweep tested and still needs not working__: Reported and waiting for Gonzalo.
+
+__2026-11-15 - Depends workflow is complete so the apply stage has been eliminated__: Current 12-site runs are now scheduled with this. 
+
 ## Data
 
 __2026-10-02 - 4-site and 8-site calculations are running.__: Data has been added to folders.
@@ -45,7 +49,9 @@ __2026-11-10 - Massively parallel 12-site runs for GPU scheduled on NERSC__: Jus
 
 __2026-11-12 - Parallel runs takes a long time to start__: NERSC only allows two jobs to accrue priority by time so the rest acts as if they were just submitted. Need to rethink this workflow!
 
-__2026-11-13 - Massively parallel 12-site runs for GPU scheduled on NERSC__: The former runs have been cancelled and a new 1000 node job has been queued to run for 12 site that does td and twotime together. 
+__2026-11-13 - Massively parallel 12-site runs for GPU scheduled on NERSC__: The former runs have been cancelled and a new 1000 node job has been queued to run for 12 site that does td and twotime together.
+
+__2026-11-15 - Parallel runs were not starting on time and would have taken double the time for a single workflow__: td and twotime workflows have been separated and are now requeued on NERSC.
 
 ## Home
 

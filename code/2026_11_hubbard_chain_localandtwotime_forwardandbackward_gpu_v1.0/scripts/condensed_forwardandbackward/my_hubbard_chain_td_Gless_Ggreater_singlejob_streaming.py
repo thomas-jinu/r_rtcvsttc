@@ -78,7 +78,7 @@ def frequency_tag(value: float) -> str:
 
 def time_axis(a: argparse.Namespace) -> list[float]:
     maximum = (a.Pump_time_steps - 1) * a.TSPTau
-    return [-0.1, *(round(i * a.TSPTau, 9) for i in range(a.Pump_time_steps)), round(maximum + 0.1, 9)]
+    return [-a.TSPTau, *(round(i * a.TSPTau, 9) for i in range(a.Pump_time_steps)), round(maximum + a.TSPTau, 9)]
 
 
 def pump_axis(a: argparse.Namespace, times: list[float]) -> list[float]:

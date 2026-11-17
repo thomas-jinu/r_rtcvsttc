@@ -36,6 +36,8 @@ def main():
     p.add_argument("--probe-count", type=int, required=True)
     p.add_argument("--input-convention", choices=("correlator", "green"), required=True,
                    help="correlator: input is the raw measured correlator; green: input includes the conventional i factor")
+    p.add_argument('--frequency-sign', choices=('lesser', 'greater'), default='greater',
+                   help='lesser: exp(+i omega (t-t_prime)); greater: exp(-i omega (t-t_prime)) (default)')
     a = p.parse_args()
     if a.sigma <= 0 or a.omega_count < 1 or a.probe_count < 1:
         p.error("sigma and sample counts must be positive")
@@ -61,8 +63,8 @@ def main():
     if not groups:
         raise ValueError("Input CSV is empty")
 
-    # Eq. 27 has exp(-i omega (t-t')). Output uses the correlation function
-    # C=-i G<, giving a conventionally real intensity for a diagonal spectrum.
+    # Select the frequency kernel independently of the input prefactor convention.
+    sign = 1 if a.frequency_sign == 'lesser' else -1
     omega = np.linspace(a.omega_min, a.omega_max, a.omega_count)
     probes = np.linspace(a.probe_min, a.probe_max, a.probe_count)
     with a.output_csv.open("w", newline="", encoding="utf-8") as f:
@@ -81,7 +83,7 @@ def main():
                 left = wt * np.exp(-0.5 * ((t - t0) / a.sigma) ** 2)
                 right = wp * np.exp(-0.5 * ((tp - t0) / a.sigma) ** 2)
                 for w in omega:
-                    value = (left * np.exp(-1j * w * t)) @ matrix @ (right * np.exp(1j * w * tp))
+                    value = (left * np.exp(sign * 1j * w * t)) @ matrix @ (right * np.exp(-sign * 1j * w * tp))
                     writer.writerow((*pair, f"{t0:.15g}", f"{w:.15g}", f"{value.real:.15g}", f"{value.imag:.15g}"))
     print(f"Wrote {a.output_csv}; finite time range and probe truncation affect the result.")
 
