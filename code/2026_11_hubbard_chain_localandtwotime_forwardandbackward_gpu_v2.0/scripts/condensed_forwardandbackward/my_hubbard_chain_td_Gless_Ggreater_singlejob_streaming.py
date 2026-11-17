@@ -7,11 +7,13 @@ import csv
 import json
 import math
 import os
+import queue
 import re
 import shlex
 import shutil
 import subprocess
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -46,8 +48,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pump-frequency", type=float, required=True)
     execution = p.add_mutually_exclusive_group()
     execution.add_argument("--submit", action="store_true", help="Submit the generated Slurm batch script")
-    execution.add_argument("--run", action="store_true", help="Run TD and all G steps serially on the current compute node")
+    execution.add_argument("--run", action="store_true", help="Run TD then parallel G pipelines on the current GPU node")
     p.add_argument("--cpus-per-task", type=int, default=128)
+    p.add_argument("--run-gpus", type=int, default=4, help="Maximum GPUs for parallel --run G pipelines (one pipeline per GPU; default: 4)")
     p.add_argument(
         "--g-worker-nodes", type=int, default=None,
         help="Exclusive nodes available to G work (default: 2 per time step).",
@@ -66,6 +69,8 @@ def validate(a: argparse.Namespace) -> None:
         raise ValueError("center_site must be a valid site index")
     if a.cpus_per_task < 1:
         raise ValueError("cpus-per-task must be positive")
+    if a.run_gpus < 1:
+        raise ValueError("run-gpus must be positive")
     if a.g_worker_nodes is None:
         a.g_worker_nodes = 2 * a.Pump_time_steps
     if a.g_worker_nodes < 2:
@@ -353,7 +358,7 @@ def postprocess_commands(a: argparse.Namespace, td_folder: Path, gless: Path, gg
 
 
 def run_serial(a: argparse.Namespace, td_folder: Path, td_input_path: Path, gless: Path, ggreater: Path, run_name: str) -> None:
-    """Run TD, then each G< and G> step sequentially on the current node."""
+    """Run TD, then independent G pipelines concurrently, one per GPU."""
     environment = os.environ.copy()
     environment["OMP_NUM_THREADS"] = str(
         max(1, a.cpus_per_task // 2) if a.cluster == "nersc" else a.cpus_per_task
@@ -388,22 +393,57 @@ def run_serial(a: argparse.Namespace, td_folder: Path, td_input_path: Path, gles
 
     atexit.register(write_failure_report)
     run(td_folder, td_input_path.name, TD_OPERATORS)
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible is None:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=uuid", "--format=csv,noheader"],
+            capture_output=True, text=True, check=True,
+        )
+        devices = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    else:
+        devices = [device.strip() for device in visible.split(",") if device.strip() and device.strip() != "-1"]
+    devices = devices[:a.run_gpus]
+    if not devices:
+        raise RuntimeError("No visible GPUs available for --run")
+    available = queue.Queue()
+    for device in devices:
+        available.put(device)
+    threads_per_run = max(1, int(environment["OMP_NUM_THREADS"]) // len(devices))
+
+    def pipeline(work: Path, operator: str) -> bool:
+        device = available.get()
+        env = environment.copy()
+        env["CUDA_VISIBLE_DEVICES"] = device
+        env["OMP_NUM_THREADS"] = str(threads_per_run)
+        env["OMP_PROC_BIND"] = "false"
+        (work / ".g_pipeline_status").write_text("running\n", encoding="utf-8")
+        try:
+            with (work / "streamed.stdout").open("w", encoding="utf-8") as out, (work / "streamed.stderr").open("w", encoding="utf-8") as err:
+                for stage in ("evolve_forward", "evolve_backward"):
+                    subprocess.run(
+                        ["./dmrg", "-f", f"input_twotime_{run_name}_{stage}.ain", "-p", str(DMRG_PRECISION), operator],
+                        cwd=work, env=env, stdout=out, stderr=err, check=True,
+                    )
+            (work / ".g_pipeline_status").write_text("complete\n", encoding="utf-8")
+            return True
+        except (subprocess.CalledProcessError, OSError) as exc:
+            (work / ".g_pipeline_status").write_text("failed\n", encoding="utf-8")
+            print(f"G pipeline failed for {work}: {exc}; continuing other steps.", flush=True)
+            return False
+        finally:
+            available.put(device)
+
+    print(f"Running up to {len(devices)} G pipelines concurrently, {threads_per_run} OpenMP threads each.", flush=True)
     failed_steps = []
-    for step in range(a.Pump_time_steps):
-        for folder, evolve_op in (
-            (gless, "<P2|c'|P3>"),
-            (ggreater, "<P2|c|P3>"),
-        ):
-            work = folder / f"step_{step:04d}"
-            (work / ".g_pipeline_status").write_text("running\n", encoding="utf-8")
-            try:
-                for stage, operator in (("evolve_forward", evolve_op), ("evolve_backward", evolve_op)):
-                    run(work, f"input_twotime_{run_name}_{stage}.ain", operator)
-                (work / ".g_pipeline_status").write_text("complete\n", encoding="utf-8")
-            except subprocess.CalledProcessError:
-                (work / ".g_pipeline_status").write_text("failed\n", encoding="utf-8")
-                failed_steps.append(work)
-                print(f"G pipeline failed for {work}; continuing other steps.", flush=True)
+    with ThreadPoolExecutor(max_workers=len(devices)) as executor:
+        futures = {
+            executor.submit(pipeline, folder / f"step_{step:04d}", op): folder / f"step_{step:04d}"
+            for step in range(a.Pump_time_steps)
+            for folder, op in ((gless, "<P2|c'|P3>"), (ggreater, "<P2|c|P3>"))
+        }
+        for future in as_completed(futures):
+            if not future.result():
+                failed_steps.append(futures[future])
     failure_log = td_folder / "failed_g_steps.txt"
     write_failure_report()
     commands = postprocess_commands(a, td_folder, gless, ggreater, run_name)
@@ -415,7 +455,7 @@ def run_serial(a: argparse.Namespace, td_folder: Path, td_input_path: Path, gles
             subprocess.run(command, check=True)
     if failed_steps:
         raise RuntimeError(f"Failed G steps to rerun are listed in {failure_log}")
-    print("TD and all serial G< / G> step pipelines completed and post-processed.")
+    print("TD and all parallel G< / G> step pipelines completed and post-processed.")
 
 
 def main() -> int:
