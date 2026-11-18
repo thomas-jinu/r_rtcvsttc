@@ -12,6 +12,7 @@ import shlex
 import shutil
 import subprocess
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -46,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pump-frequency", type=float, required=True)
     execution = p.add_mutually_exclusive_group()
     execution.add_argument("--submit", action="store_true", help="Submit the generated Slurm batch script")
-    execution.add_argument("--run", action="store_true", help="Run TD and all G steps serially on the current compute node")
+    execution.add_argument("--run", action="store_true", help="Run TD, then G pipelines concurrently on the current node")
     p.add_argument("--cpus-per-task", type=int, default=256)
     p.add_argument(
         "--g-worker-nodes", type=int, default=None,
@@ -349,7 +350,7 @@ def postprocess_commands(a: argparse.Namespace, td_folder: Path, gless: Path, gg
 
 
 def run_serial(a: argparse.Namespace, td_folder: Path, td_input_path: Path, gless: Path, ggreater: Path, run_name: str) -> None:
-    """Run TD, then each G< and G> step sequentially on the current node."""
+    """Run TD, then concurrent G pipelines within the current node allocation."""
     environment = os.environ.copy()
     environment["OMP_NUM_THREADS"] = str(
         max(1, a.cpus_per_task // 2) if a.cluster == "nersc" else a.cpus_per_task
@@ -384,22 +385,46 @@ def run_serial(a: argparse.Namespace, td_folder: Path, td_input_path: Path, gles
 
     atexit.register(write_failure_report)
     run(td_folder, td_input_path.name, TD_OPERATORS)
+    total_cpus = int(os.environ.get("SLURM_CPUS_ON_NODE", os.cpu_count() or 1))
+    if a.cpus_per_task > total_cpus:
+        raise ValueError(f"cpus-per-task ({a.cpus_per_task}) exceeds available CPUs ({total_cpus})")
+    parallel = min(len(all_steps), total_cpus // a.cpus_per_task)
+    print(f"Running up to {parallel} G pipelines concurrently, {a.cpus_per_task} CPUs per pipeline.", flush=True)
+
+    def pipeline(work: Path, operator: str) -> bool:
+        (work / ".g_pipeline_status").write_text("running\n", encoding="utf-8")
+        try:
+            # One srun owns the CPU allocation for both sequential stages.
+            if a.cluster == "nersc":
+                command = ["srun", "--exclusive", "--exact", "--nodes=1", "--ntasks=1",
+                           f"--cpus-per-task={a.cpus_per_task}", "--cpu-bind=cores", "bash", "-c",
+                           'set -e; ./dmrg -f "$1" -p "$3" "$4"; ./dmrg -f "$2" -p "$3" "$4"',
+                           "_", f"input_twotime_{run_name}_evolve_forward.ain",
+                           f"input_twotime_{run_name}_evolve_backward.ain", str(DMRG_PRECISION), operator]
+                commands = [command]
+            else:
+                commands = [["./dmrg", "-f", f"input_twotime_{run_name}_{stage}.ain", "-p", str(DMRG_PRECISION), operator]
+                            for stage in ("evolve_forward", "evolve_backward")]
+            with (work / "streamed.stdout").open("w", encoding="utf-8") as out, (work / "streamed.stderr").open("w", encoding="utf-8") as err:
+                for command in commands:
+                    subprocess.run(command, cwd=work, env=environment, stdout=out, stderr=err, check=True)
+            (work / ".g_pipeline_status").write_text("complete\n", encoding="utf-8")
+            return True
+        except (subprocess.CalledProcessError, OSError) as exc:
+            (work / ".g_pipeline_status").write_text("failed\n", encoding="utf-8")
+            print(f"G pipeline failed for {work}: {exc}; continuing other steps.", flush=True)
+            return False
+
     failed_steps = []
-    for step in range(a.Pump_time_steps):
-        for folder, evolve_op in (
-            (gless, "<P2|c'|P3>"),
-            (ggreater, "<P2|c|P3>"),
-        ):
-            work = folder / f"step_{step:04d}"
-            (work / ".g_pipeline_status").write_text("running\n", encoding="utf-8")
-            try:
-                for stage, operator in (("evolve_forward", evolve_op), ("evolve_backward", evolve_op)):
-                    run(work, f"input_twotime_{run_name}_{stage}.ain", operator)
-                (work / ".g_pipeline_status").write_text("complete\n", encoding="utf-8")
-            except subprocess.CalledProcessError:
-                (work / ".g_pipeline_status").write_text("failed\n", encoding="utf-8")
-                failed_steps.append(work)
-                print(f"G pipeline failed for {work}; continuing other steps.", flush=True)
+    with ThreadPoolExecutor(max_workers=parallel) as executor:
+        futures = {
+            executor.submit(pipeline, folder / f"step_{step:04d}", operator): folder / f"step_{step:04d}"
+            for step in range(a.Pump_time_steps)
+            for folder, operator in ((gless, "<P2|c'|P3>"), (ggreater, "<P2|c|P3>"))
+        }
+        for future in as_completed(futures):
+            if not future.result():
+                failed_steps.append(futures[future])
     failure_log = td_folder / "failed_g_steps.txt"
     write_failure_report()
     commands = postprocess_commands(a, td_folder, gless, ggreater, run_name)
@@ -411,7 +436,7 @@ def run_serial(a: argparse.Namespace, td_folder: Path, td_input_path: Path, gles
             subprocess.run(command, check=True)
     if failed_steps:
         raise RuntimeError(f"Failed G steps to rerun are listed in {failure_log}")
-    print("TD and all serial G< / G> step pipelines completed and post-processed.")
+    print("TD and all G< / G> step pipelines completed and post-processed.")
 
 
 def main() -> int:
