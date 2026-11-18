@@ -22,7 +22,7 @@ DMRG_EXECUTABLES = {
     "local": Path(
         "/Users/qqt/Documents/Codes/dmrgpp_alltimerecovery_fixes/dmrgpp/build/dmrg/dmrg"
     ),
-    "nersc": Path("/pscratch/sd/t/thomasj2/r_rtcvsttc/data/2026_november/14_12site_GPU_twotime/dmrgpp_fixrestart/dmrgpp/build_perlmutter_nvidia_cuda/dmrg/dmrg"),
+    "nersc": Path("/pscratch/sd/t/thomasj2/r_rtcvsttc/data/2026_november/14_12site_GPU_twotime/dmrgpp_fixrestart/dmrgpp_cpu/build_perlmutter_cpu_threads/dmrg/dmrg"),
     # "nersc": Path(
     #     "/Users/qqt/Documents/Codes/dmrgpp_pvector/copy_dmrg/installdir/bin/dmrg"
     # ),
