@@ -4,6 +4,7 @@ Generate and optionally run a two-time Hubbard-chain calculation.
 
 import argparse
 import csv
+import json
 import re
 from pathlib import Path
 
@@ -68,17 +69,32 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument(
         "process_file",
+        nargs="?",
         type=Path,
         help="Process an existing output file.",
     )
 
     parser.add_argument(
         "pump_file",
+        nargs="?",
         type=Path,
         help="Path to the pump file.",
     )
 
-    return parser.parse_args()
+    parser.add_argument("--sweep-dir", type=Path, help="Parent directory containing TD frequency-run folders")
+    parser.add_argument("--frequency-min", type=float, help="Inclusive lower frequency filter (requires --sweep-dir)")
+    parser.add_argument("--frequency-max", type=float, help="Inclusive upper frequency filter (requires --sweep-dir)")
+    args = parser.parse_args()
+    if args.sweep_dir:
+        if args.process_file or args.pump_file:
+            parser.error("--sweep-dir cannot be combined with process_file or pump_file")
+    elif not args.process_file or not args.pump_file:
+        parser.error("supply process_file and pump_file, or --sweep-dir")
+    elif args.frequency_min is not None or args.frequency_max is not None:
+        parser.error("frequency filters require --sweep-dir")
+    if args.frequency_min is not None and args.frequency_max is not None and args.frequency_min > args.frequency_max:
+        parser.error("frequency-min must not exceed frequency-max")
+    return args
 
 
 def read_pump_file(pump_file_path: Path) -> tuple[list[float], list[float]]:
@@ -222,14 +238,48 @@ def main() -> int:
     """Generate inputs, optionally run DMRG++, and collect the results."""
     args = parse_args()
 
-    time_axis, pump_axis = read_pump_file(args.pump_file)
+    if not args.sweep_dir:
+        time_axis, _ = read_pump_file(args.pump_file)
+        csv_path = process_td_results(args.process_file, len(time_axis), time_axis)
+        print(f"Wrote post-processed data: {csv_path}")
+        return 0
 
-    csv_path = process_td_results(
-        output_path=args.process_file,
-        number_of_steps=len(time_axis),
-        time_axis=time_axis,
-    )
-    print(f"Wrote post-processed data: {csv_path}")
+    if not args.sweep_dir.is_dir():
+        raise FileNotFoundError(f"Sweep directory not found: {args.sweep_dir}")
+    matched = 0
+    failed = 0
+    for folder in sorted(args.sweep_dir.glob("td_N=*")):
+        if not folder.is_dir():
+            continue
+        metadata = list(folder.glob("input_args_td_*.json"))
+        if len(metadata) != 1:
+            print(f"Skipping {folder}: expected one TD metadata file")
+            continue
+        try:
+            with metadata[0].open(encoding="utf-8") as f:
+                frequency = float(json.load(f)["pump_frequency"])
+            if args.frequency_min is not None and frequency < args.frequency_min:
+                continue
+            if args.frequency_max is not None and frequency > args.frequency_max:
+                continue
+            matched += 1
+            inputs = list(folder.glob("input_td_*.ain"))
+            if len(inputs) != 1:
+                raise ValueError("expected exactly one TD input file")
+            output = folder / f"runFor{inputs[0].stem}.cout"
+            time_axis, _ = read_pump_file(folder / "pump_table.csv")
+            csv_path = process_td_results(output, len(time_axis), time_axis)
+            destination = args.sweep_dir / f"{folder.name}_operators.csv"
+            csv_path.replace(destination)
+            print(f"Frequency {frequency:g}: wrote {destination}")
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            failed += 1
+            print(f"Failed to process {folder}: {error}")
+    if matched == 0:
+        raise ValueError("No TD runs matched the requested frequency range")
+    if failed:
+        print(f"Failed to process {failed} of {matched} matched TD runs")
+        return 1
     return 0
 
 
