@@ -57,6 +57,8 @@ __2026-11-15 - Parallel runs were not starting on time and would have taken doub
 
 __2026-11-16 - Restart fixed dmrg copied to the G folders__: Local tests show that restarts work just fine.
 
+__2026-11-17 - Cancelled 12-site runs. Will now collect 8-site data__: The runs would have burned all of NERSC allocation which Phil also has an eye on. Thomas approved this.
+
 ## Home
 
 __2026-11-08 - Reorganized project directory.__ Moved markdown notes here instead of Zettler.
