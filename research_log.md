@@ -41,6 +41,8 @@ __2026-11-15 - Depends workflow is complete so the apply stage has been eliminat
 
 __2026-11-16 - Gonzalo fixed the restart bug__: Tested locally and compiled on NERSC.
 
+__2026-11-18 - Claude and Codex implementations of updated scripts for XAS__ : Heavily relied on them to generate more robust scripts.
+
 ## Data
 
 __2026-10-02 - 4-site and 8-site calculations are running.__: Data has been added to folders.
@@ -58,6 +60,8 @@ __2026-11-15 - Parallel runs were not starting on time and would have taken doub
 __2026-11-16 - Restart fixed dmrg copied to the G folders__: Local tests show that restarts work just fine.
 
 __2026-11-17 - Cancelled 12-site runs. Will now collect 8-site data__: The runs would have burned all of NERSC allocation which Phil also has an eye on. Thomas approved this.
+
+__2026-11-18 - 4 site local observables data__ : Collected and added it to the analysis.
 
 ## Home
 
