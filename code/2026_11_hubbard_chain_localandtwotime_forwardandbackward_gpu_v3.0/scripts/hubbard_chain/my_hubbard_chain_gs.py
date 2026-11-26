@@ -57,7 +57,7 @@ def parse_args_input() -> argparse.Namespace:
     parser.add_argument("finite_loops", type=int)
     parser.add_argument("finite_kept", type=int)
     parser.add_argument("cluster", choices=["local", "nersc"])
-    parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "runs", help="Parent directory for generated runs")
+    parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT, help="Parent directory for generated runs (default: project root)")
     execution_group = parser.add_mutually_exclusive_group()
     execution_group.add_argument("--run", action="store_true", help="Run DMRG++ after generating input")
     execution_group.add_argument("--submit", action="store_true", help="Submit DMRG++ job after generating input")
